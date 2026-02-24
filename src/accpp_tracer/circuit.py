@@ -258,8 +258,9 @@ class Tracer:
     def trace(
         self,
         prompt: str,
-        answer_token: str | int,
+        answer_token: str | int | list[str | int] | None = None,
         wrong_token: str | int | None = None,
+        top_p: float | None = None,
         attn_weight_thresh: str | float = "dynamic",
     ) -> nx.MultiDiGraph:
         """Trace a single prompt (Level 3 — simplest API).
@@ -267,14 +268,23 @@ class Tracer:
         Handles tokenization, forward pass, token mapping, logit direction
         computation, seed identification, and recursive circuit tracing.
 
+        Supports tracing multiple logit directions simultaneously. Each direction
+        becomes a separate root node in the returned merged graph. Attention head
+        subgraphs shared between directions are traced only once.
+
         Args:
             prompt: Input text string.
-            answer_token: Correct next token (str or token id).
-            wrong_token: Optional contrastive token for logit diff direction.
-                If provided, logit_direction = W_U[:, answer] - W_U[:, wrong].
-                If None, logit_direction = W_U[:, answer].
-            attn_weight_thresh: "dynamic" (= 2.5/context_size) or a float
-                in [0, 1].
+            answer_token: Correct next token (str, int, or list of str/int). When
+                a list is supplied each element becomes its own logit direction and
+                root node in the merged circuit graph. Ignored when top_p is set.
+                Must be provided when top_p is None.
+            wrong_token: Optional contrastive token. When supplied, every direction
+                becomes W_U[:, answer_i] - W_U[:, wrong]. Applied to all directions.
+            top_p: If set, ignores answer_token and automatically selects the minimum
+                set of top tokens whose cumulative probability >= top_p (standard
+                nucleus / top-p definition). Each selected token becomes its own
+                direction. wrong_token is still applied if provided.
+            attn_weight_thresh: "dynamic" (= 2.5/context_size) or a float in [0, 1].
 
         Returns:
             nx.MultiDiGraph — the traced circuit graph.
@@ -285,18 +295,9 @@ class Tracer:
         tokens = model.to_tokens(prompt)  # shape: (1, seq_len)
         end_token_pos = tokens.shape[1] - 1
 
-        # Forward pass
+        # Forward pass — logits needed for top_p
         with torch.no_grad():
-            _, cache = model.run_with_cache(tokens)
-
-        # Compute logit direction
-        if isinstance(answer_token, str):
-            answer_token = model.to_single_token(answer_token)
-        logit_direction = model.W_U[:, answer_token].clone()
-        if wrong_token is not None:
-            if isinstance(wrong_token, str):
-                wrong_token = model.to_single_token(wrong_token)
-            logit_direction = logit_direction - model.W_U[:, wrong_token]
+            logits, cache = model.run_with_cache(tokens)
 
         # Build idx_to_token from actual tokens (with duplicate handling)
         idx_to_token: dict[int, str] = {}
@@ -310,108 +311,163 @@ class Tracer:
                 idx_to_token[i] = tok_str
             count_dict[tok_str] += 1
 
-        # Root node
-        root_node = ("Logit direction", idx_to_token[end_token_pos])
+        # Resolve wrong_token once; applied to every direction
+        if wrong_token is not None and isinstance(wrong_token, str):
+            wrong_token = model.to_single_token(wrong_token)
+        wrong_dir = model.W_U[:, wrong_token].clone() if wrong_token is not None else None
+
+        # Determine which token IDs to trace
+        if top_p is None and answer_token is None:
+            raise ValueError("Either answer_token or top_p must be provided.")
+
+        if top_p is not None:
+            # Select minimum set of top tokens covering top_p probability mass
+            probs = torch.softmax(logits[0, end_token_pos], dim=-1)
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+            cumsum = torch.cumsum(sorted_probs, dim=0)
+            n_selected = int((torch.where(cumsum >= top_p)[0][0] + 1).item())
+            token_ids: list[int] = sorted_indices[:n_selected].tolist()
+            multi = True
+        elif isinstance(answer_token, list):
+            # Explicit list of tokens — resolve strings to ints
+            token_ids = [
+                model.to_single_token(t) if isinstance(t, str) else t
+                for t in answer_token
+            ]
+            multi = True
+        else:
+            # Single token — backward-compatible path
+            if isinstance(answer_token, str):
+                answer_token = model.to_single_token(answer_token)
+            token_ids = [answer_token]
+            multi = False
+
+        # Build one logit direction and root node per selected token
+        logit_directions: list[Tensor] = []
+        root_nodes: list[tuple] = []
+        for tok_id in token_ids:
+            direction = model.W_U[:, tok_id].clone()
+            if wrong_dir is not None:
+                direction = direction - wrong_dir
+            logit_directions.append(direction)
+            if multi:
+                tok_str = model.tokenizer.decode(tok_id)
+                root_nodes.append((f"Logit '{tok_str}'", idx_to_token[end_token_pos]))
+            else:
+                # Preserve backward-compatible root node label for single-token callers
+                root_nodes.append(("Logit direction", idx_to_token[end_token_pos]))
 
         return self.trace_from_cache(
             cache=cache,
-            logit_direction=logit_direction,
+            logit_direction=logit_directions[0] if not multi else logit_directions,
             end_token_pos=end_token_pos,
             idx_to_token=idx_to_token,
-            root_node=root_node,
+            root_node=root_nodes[0] if not multi else root_nodes,
             prompt_idx=0,
             attn_weight_thresh=attn_weight_thresh,
         )
 
-    @typechecked
     def trace_from_cache(
         self,
         cache: ActivationCache,
-        logit_direction: Float[Tensor, "d_model"],
+        logit_direction: Tensor | list[Tensor],
         end_token_pos: int,
         idx_to_token: dict[int, str],
-        root_node: tuple,
+        root_node: tuple | list[tuple],
         prompt_idx: int = 0,
         attn_weight_thresh: str | float = "dynamic",
     ) -> nx.MultiDiGraph:
         """Trace from a pre-computed cache (Level 2 — advanced API).
 
-        The user provides the cache, logit direction, token mapping, and root
-        node. This is what paper reproduction scripts call in a loop.
+        The user provides the cache, logit direction(s), token mapping, and root
+        node(s). This is what paper reproduction scripts call in a loop.
+
+        Supports tracing multiple logit directions simultaneously. Pass parallel
+        lists for logit_direction and root_node to trace each direction as a
+        separate root node in the same returned graph. The is_traced state is
+        shared across directions, so attention head subgraphs common to multiple
+        directions are traced only once. Single-direction callers are unaffected:
+        passing a single Tensor and tuple behaves identically to before.
 
         Args:
             cache: ActivationCache from model.run_with_cache().
-            logit_direction: Direction in residual stream to trace
-                (e.g., W_U[:, IO] - W_U[:, S]).
+            logit_direction: Single direction tensor or list of direction tensors
+                in residual stream space (e.g., W_U[:, IO] - W_U[:, S]).
             end_token_pos: Position of the output token.
             idx_to_token: Dict mapping token position (int) to label (str).
-            root_node: Tuple label for the root/output node in the graph.
+            root_node: Single tuple or list of tuples (one per direction) for
+                the root/output node label(s) in the graph.
             prompt_idx: Index of this prompt in the cache batch.
             attn_weight_thresh: "dynamic" or float in [0, 1].
 
         Returns:
-            nx.MultiDiGraph — the traced circuit graph.
+            nx.MultiDiGraph — the traced circuit graph. Empty if no direction
+            produces seeds with at least one attention head.
         """
         model = self.model
 
-        # Get seeds
-        trace_seeds, seeds_contrib = get_seeds(
-            model,
-            self.config,
-            cache,
-            prompt_idx,
-            logit_direction,
-            end_token_pos,
-            self.device,
-        )
+        dirs = [logit_direction] if isinstance(logit_direction, Tensor) else logit_direction
+        roots = [root_node] if isinstance(root_node, tuple) else root_node
 
-        if len(trace_seeds) == 0:
-            return nx.MultiDiGraph()
-
-        # Check if any AH seeds exist
-        has_ah_seed = any(
-            ah_idx < model.cfg.n_heads for _, ah_idx, _ in trace_seeds
-        )
-        if not has_ah_seed:
-            return nx.MultiDiGraph()
-
-        # Build circuit graph
+        # Build circuit graph — shared across all directions
         G = nx.MultiDiGraph()
         is_traced: dict[tuple, int] = {}
 
-        for layer, ah_idx, src_token in trace_seeds:
-            ah_idx_label = get_ah_idx_label(ah_idx, model.cfg.n_heads)
+        for direction, root in zip(dirs, roots):
+            # Get seeds for this direction
+            trace_seeds, seeds_contrib = get_seeds(
+                model,
+                self.config,
+                cache,
+                prompt_idx,
+                direction,
+                end_token_pos,
+                self.device,
+            )
 
-            # Add edge from seed to root node
-            if end_token_pos in idx_to_token and src_token in idx_to_token:
-                G.add_edge(
-                    (
-                        layer,
-                        ah_idx_label,
-                        idx_to_token[end_token_pos],
-                        idx_to_token[src_token],
-                    ),
-                    root_node,
-                    weight=seeds_contrib[(layer, ah_idx, src_token)],
-                    type="d",
-                    color="#E41A1C",
-                )
+            if len(trace_seeds) == 0:
+                continue
 
-            # Recursively trace upstream for AH seeds
-            if ah_idx < model.cfg.n_heads:
-                if (layer, ah_idx, end_token_pos, src_token) not in is_traced:
-                    self._trace_recursive(
-                        cache,
-                        idx_to_token,
-                        G,
-                        is_traced,
-                        prompt_idx,
-                        layer,
-                        ah_idx,
-                        end_token_pos,
-                        src_token,
-                        attn_weight_thresh,
+            # Check if any AH seeds exist for this direction
+            has_ah_seed = any(
+                ah_idx < model.cfg.n_heads for _, ah_idx, _ in trace_seeds
+            )
+            if not has_ah_seed:
+                continue
+
+            for layer, ah_idx, src_token in trace_seeds:
+                ah_idx_label = get_ah_idx_label(ah_idx, model.cfg.n_heads)
+
+                # Add edge from seed to this direction's root node
+                if end_token_pos in idx_to_token and src_token in idx_to_token:
+                    G.add_edge(
+                        (
+                            layer,
+                            ah_idx_label,
+                            idx_to_token[end_token_pos],
+                            idx_to_token[src_token],
+                        ),
+                        root,
+                        weight=seeds_contrib[(layer, ah_idx, src_token)],
+                        type="d",
+                        color="#E41A1C",
                     )
+
+                # Recursively trace upstream for AH seeds
+                if ah_idx < model.cfg.n_heads:
+                    if (layer, ah_idx, end_token_pos, src_token) not in is_traced:
+                        self._trace_recursive(
+                            cache,
+                            idx_to_token,
+                            G,
+                            is_traced,
+                            prompt_idx,
+                            layer,
+                            ah_idx,
+                            end_token_pos,
+                            src_token,
+                            attn_weight_thresh,
+                        )
 
         return G
 

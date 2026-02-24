@@ -2,6 +2,40 @@
 
 All notable changes to `accpp-tracer` are documented here.
 
+## [0.1.2] — 2026-02-24
+
+### Added
+
+- **Multi-direction tracing** (`circuit.py` — `Tracer.trace()` and
+  `Tracer.trace_from_cache()`): both methods now accept a list of logit directions
+  (and corresponding root nodes) in addition to a single direction. Each direction
+  becomes a separate root node in the same merged `nx.MultiDiGraph`. The `is_traced`
+  dict is shared across all directions so overlapping attention head subgraphs are
+  traced only once. Single-direction callers are unaffected — passing a single tensor
+  and tuple produces identical behaviour to v0.1.1.
+
+- **Top-p tracing** (`circuit.py` — `Tracer.trace()`): new `top_p: float | None`
+  parameter. When set, ignores `answer_token` and automatically selects the minimum
+  set of next-token candidates whose cumulative probability ≥ `top_p` (standard
+  nucleus / top-p definition). Each selected token becomes its own logit direction and
+  root node. `wrong_token` is still applied to every direction if supplied.
+
+### Changed
+
+- **`Tracer.trace()`**: `answer_token` parameter now also accepts `list[str | int]` or
+  `None` (backward-compatible: single str/int still works; `None` is only valid when
+  `top_p` is set — a `ValueError` is raised otherwise). New `top_p` parameter added
+  with default `None`. Forward pass now captures `logits` (was `_`) to enable top-p
+  probability computation; this is a pure internal change with no observable effect on
+  existing callers.
+
+- **`Tracer.trace_from_cache()`**: `logit_direction` now accepts `Tensor | list[Tensor]`
+  and `root_node` accepts `tuple | list[tuple]` (both backward-compatible). The
+  `@typechecked` decorator has been removed from this method because
+  `Float[Tensor, "d_model"] | list[Float[Tensor, "d_model"]]` is not supported by the
+  beartype+jaxtyping combination; the performance-critical math remains validated inside
+  `trace_firing()`.
+
 ## [0.1.1] — 2026-02-24
 
 ### Fixed
