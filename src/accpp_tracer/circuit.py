@@ -7,7 +7,7 @@ building circuit graphs.
 
 from collections import defaultdict
 from copy import deepcopy
-from typing import Tuple, Union
+from typing import Union
 
 import networkx as nx
 import numpy as np
@@ -71,7 +71,7 @@ def get_upstream_contributors_seed(
         cutoff = contrib.sum() / 2
     upstream_contributors = np.where(contrib >= cutoff)
     upstream_contributors = [
-        (layer, ah_idx, token)
+        (int(layer), int(ah_idx), int(token))
         for layer, ah_idx, token in zip(
             upstream_contributors[0],
             upstream_contributors[1],
@@ -90,7 +90,7 @@ def get_seeds(
     logit_direction: Float[Tensor, "d_model"],
     end_token_pos: int,
     device: str,
-) -> Tuple[list[tuple], dict[tuple, float]]:
+) -> tuple[list[tuple], dict[tuple, float]]:
     """Identify seed components for circuit tracing.
 
     Decomposes the residual stream at the output token position into upstream

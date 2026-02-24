@@ -1,8 +1,6 @@
 """Integrated Gradients attribution for ordering component contributions.
 """
 
-from typing import Tuple
-
 import numpy as np
 from jaxtyping import Float
 from torch import Tensor
@@ -16,7 +14,7 @@ def ig_softmax_attributions(
     j: int,
     T: int = 64,
     quadrature: str = "trapezoid",
-) -> Tuple[np.ndarray, dict]:
+) -> tuple[np.ndarray, dict]:
     """Integrated Gradients attributions for softmax probability.
 
     Computes IG attributions for p_j = softmax(S)[j] where S = sum(X, axis=0).

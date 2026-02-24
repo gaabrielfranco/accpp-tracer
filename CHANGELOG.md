@@ -2,6 +2,26 @@
 
 All notable changes to `accpp-tracer` are documented here.
 
+## [0.1.1] — 2026-02-24
+
+### Fixed
+
+- **`typing.Tuple` deprecation warnings** (`decomposition.py`, `attribution.py`,
+  `tracing.py`, `circuit.py`): replaced `typing.Tuple` with the built-in `tuple`
+  (PEP 585). Eliminates `BeartypeDecorHintPep585DeprecationWarning` emitted by
+  `beartype>=0.14` when typecheck is active. Pure annotation change, no runtime effect.
+
+- **`TypeCheckError` for `layer: int` in `trace_firing`** (two call sites):
+  - `circuit.py` — `_get_upstream_contributors`: `np.where()` returns `numpy.int64`
+    indices used as seed tuple values. Fixed with `int()` cast:
+    `(layer, ah_idx, token)` → `(int(layer), int(ah_idx), int(token))`.
+  - `tracing.py` — `_greedy_algorithm`: `np.unravel_index()` returns `numpy.intp`
+    values that become dict keys in `svs_dest`/`svs_src`. When `_trace_recursive`
+    iterates those keys and passes them to `trace_firing`, beartype rejected them.
+    Fixed by converting `top_component` immediately after `np.unravel_index()`:
+    `top_component = tuple(int(x) for x in top_component)`.
+  In both cases `int(numpy_int(x)) == x` always — no numerical change.
+
 ## [0.1.0] — 2026-02-24
 
 Initial release. Library extracted and refactored from the paper code

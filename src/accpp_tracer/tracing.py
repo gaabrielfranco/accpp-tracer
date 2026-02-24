@@ -5,7 +5,6 @@ through the model's residual stream, using singular vector (SV) decomposition.
 """
 
 from collections import defaultdict
-from typing import Tuple
 
 import numpy as np
 import torch
@@ -32,7 +31,7 @@ def _greedy_algorithm(
     attn_weight_thresh: float,
     recalculate_A_d: bool = False,
     list_order: list | None = None,
-) -> Tuple[dict, dict]:
+) -> tuple[dict, dict]:
     """Greedy component selection algorithm.
 
     Iteratively selects the upstream component that contributes most to the
@@ -118,6 +117,7 @@ def _greedy_algorithm(
                 upstream_attention_scores_breakdown[:, :, :, :, 0].shape,
             )
 
+        top_component = tuple(int(x) for x in top_component)
         # Zero out the selected component and recompute attention
         upstream_attention_scores_breakdown[top_component] = 0.0
         attention_scores = upstream_attention_scores_breakdown.sum(dim=[0, 1, 2, 3])
@@ -169,7 +169,7 @@ def _trace_firing_inner(
     M_s_all: Float[Tensor, "n_tokens d_model d_model"],
     attn_weight_thresh: float,
     config: ModelConfig,
-) -> Tuple[dict, dict, dict, dict]:
+) -> tuple[dict, dict, dict, dict]:
     """Internal trace firing implementation.
 
     Decomposes the attention score at (dest_token, src_token) into contributions
@@ -485,7 +485,7 @@ def trace_firing(
     config: ModelConfig,
     device: str,
     attn_weight_thresh: float,
-) -> Tuple[dict, dict, dict, dict]:
+) -> tuple[dict, dict, dict, dict]:
     """Trace an attention head's firing pattern back through upstream layers.
 
     Decomposes the attention weight at position (dest_token, src_token) in the

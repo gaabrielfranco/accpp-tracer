@@ -1,7 +1,5 @@
 """Omega (QK^T) SVD decomposition for attention heads."""
 
-from typing import Tuple
-
 import numpy as np
 import torch
 from einops import einsum
@@ -18,7 +16,7 @@ def get_omega_decomposition(
     model: HookedTransformer,
     config: ModelConfig,
     device: str = "cpu",
-) -> Tuple[
+) -> tuple[
     Float[Tensor, "n_layers n_heads d_model d_head"],
     Float[Tensor, "n_layers n_heads d_head"],
     Float[Tensor, "n_layers n_heads d_head d_model"],
@@ -68,7 +66,7 @@ def compute_weight_pseudoinverses(
     model: HookedTransformer,
     config: ModelConfig,
     device: str = "cpu",
-) -> Tuple[
+) -> tuple[
     Float[Tensor, "n_layers n_heads d_head d_model"],
     Float[Tensor, "n_layers n_heads d_head d_model"],
 ]:
