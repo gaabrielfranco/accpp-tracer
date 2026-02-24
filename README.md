@@ -4,10 +4,10 @@ A pip-installable library for **ACC++**, a circuit tracing algorithm for mechani
 interpretability of transformer attention heads.
 
 ACC++ decomposes attention head firings into upstream contributions using SVD of the
-bilinear form Ω = W_Q W_K^T, producing per-prompt circuit graphs that reveal how
+bilinear form $\Omega = W_Q W_K^T$, producing per-prompt circuit graphs that reveal how
 information flows through the model.
 
-From the paper: *"Finding Highly Interpretable Prompt-Specific Circuits in Language Models"*.
+From the paper: ["Finding Highly Interpretable Prompt-Specific Circuits in Language Models"](https://arxiv.org/abs/2602.13483).
 
 ## Installation
 
@@ -109,9 +109,10 @@ README for full instructions on reproducing the paper results.
 ## Citation
 
 ```bibtex
-@article{accpp2025,
+@article{franco2026finding,
   title={Finding Highly Interpretable Prompt-Specific Circuits in Language Models},
-  author={TODO},
-  year={2025}
+  author={Franco, Gabriel and Tassis, Lucas M and Rohr, Azalea and Crovella, Mark},
+  journal={arXiv preprint arXiv:2602.13483},
+  year={2026}
 }
 ```
