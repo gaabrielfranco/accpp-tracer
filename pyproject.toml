@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "accpp-tracer"
+version = "0.1.0"
+description = "ACC++ circuit tracer for mechanistic interpretability of transformer attention heads"
+requires-python = "==3.10.*"
+# Versions pinned to signals-stream conda env for numerical reproducibility.
+# The tracer is sensitive to TransformerLens internals — different versions
+# produce different numerical results that cascade through the greedy algorithm.
+dependencies = [
+    "torch==2.6.0",
+    "transformer-lens==2.17.0",
+    "transformers==4.52.1",
+    "einops==0.8.1",
+    "jaxtyping==0.3.2",
+    "numpy==1.26.4",
+    "scipy==1.15.3",
+    "networkx==3.4.2",
+    "pandas==2.2.3",
+    "tqdm==4.67.1",
+    "matplotlib==3.10.3",
+    "seaborn==0.13.2",
+    "safetensors==0.5.3",
+    "accelerate==1.7.0",
+    "h5py==3.13.0",
+]
+
+[project.optional-dependencies]
+typecheck = [
+    "beartype>=0.15",
+]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
