@@ -2,6 +2,24 @@
 
 All notable changes to `accpp-tracer` are documented here.
 
+## [0.1.3] — 2026-02-24
+
+### Fixed
+
+- **`pyproject.toml` version not bumped**: package version was still `0.1.0` after the
+  v0.1.2 release; corrected to `0.1.3`.
+
+- **`beartype` version constraint too high** (`pyproject.toml` — `[typecheck]` extra):
+  `beartype>=0.15` conflicted with `transformer-lens==2.16.1`, which requires
+  `beartype<0.15,>=0.14.1`. Lowered to `beartype>=0.14.1`. The v0.1.1 fix
+  (replacing `typing.Tuple` with built-in `tuple`) already ensures full compatibility
+  with beartype 0.14.x; no code change required.
+
+- **`transformer-lens` pin updated** (`pyproject.toml`): `==2.17.0` → `==2.16.1` to
+  align with the locked `interpreting-signals` conda environment used for SCC
+  validation runs. All numerical differences between TL 2.16 and 2.17 were previously
+  confirmed to be version-caused, not algorithmic errors.
+
 ## [0.1.2] — 2026-02-24
 
 ### Added

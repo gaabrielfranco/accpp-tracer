@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "accpp-tracer"
-version = "0.1.0"
+version = "0.1.3"
 description = "ACC++ circuit tracer for mechanistic interpretability of transformer attention heads"
 requires-python = "==3.10.*"
 # Versions pinned to signals-stream conda env for numerical reproducibility.
@@ -12,7 +12,7 @@ requires-python = "==3.10.*"
 # produce different numerical results that cascade through the greedy algorithm.
 dependencies = [
     "torch==2.6.0",
-    "transformer-lens==2.17.0",
+    "transformer-lens==2.16.1",
     "transformers==4.52.1",
     "einops==0.8.1",
     "jaxtyping==0.3.2",
@@ -30,7 +30,7 @@ dependencies = [
 
 [project.optional-dependencies]
 typecheck = [
-    "beartype>=0.15",
+    "beartype>=0.14.1",
 ]
 dev = [
     "pytest>=7.0",
