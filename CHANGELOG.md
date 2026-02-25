@@ -2,6 +2,19 @@
 
 All notable changes to `accpp-tracer` are documented here.
 
+## [0.1.4] — 2026-02-25
+
+### Fixed
+
+- **TF32 precision loss on CUDA** (`circuit.py` — `Tracer.__init__`): Ampere-class
+  GPUs (A100, RTX 3090+) enable TF32 by default for matmul (10 mantissa bits vs 23
+  for fp32). The accumulated rounding error across the many `einsum` calls in
+  `_trace_firing_inner` caused the decomposition-sum to diverge from the cached
+  attention scores beyond `atol=1e-3`, triggering the correctness assertion.
+  Fixed by setting `torch.backends.cuda.matmul.allow_tf32 = False` and
+  `torch.backends.cudnn.allow_tf32 = False` in `Tracer.__init__` when the device is
+  CUDA. No effect on CPU or MPS runs.
+
 ## [0.1.3] — 2026-02-24
 
 ### Fixed

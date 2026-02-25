@@ -231,6 +231,15 @@ class Tracer:
         self.device = device or str(model.cfg.device)
         self.config = get_model_config(model, use_numpy_svd=use_numpy_svd)
 
+        # Disable TF32 on CUDA. Ampere+ GPUs use TF32 by default for
+        # matmul (10 mantissa bits vs 23 for fp32), causing accumulated rounding
+        # errors across the many einsum calls in _trace_firing_inner that push
+        # the decomposition-sum beyond the atol=1e-3 correctness assertion.
+        # Full fp32 is required here for numerical equivalence with CPU/MPS.
+        if "cuda" in self.device:
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+
         # Precompute expensive model-level quantities
         self.U, self.S, self.VT = get_omega_decomposition(
             model, self.config, self.device
