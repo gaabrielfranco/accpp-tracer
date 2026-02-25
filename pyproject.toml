@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "accpp-tracer"
-version = "0.1.4"
+version = "0.1.5"
 description = "ACC++ circuit tracer for mechanistic interpretability of transformer attention heads"
 requires-python = "==3.10.*"
 # Versions pinned to signals-stream conda env for numerical reproducibility.

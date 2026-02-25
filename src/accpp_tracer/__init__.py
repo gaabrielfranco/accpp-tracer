@@ -1,6 +1,6 @@
 """ACC++ circuit tracer for mechanistic interpretability of transformer attention heads."""
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 from .circuit import Tracer, get_seeds
 from .decomposition import compute_weight_pseudoinverses, get_omega_decomposition

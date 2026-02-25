@@ -2,6 +2,18 @@
 
 All notable changes to `accpp-tracer` are documented here.
 
+## [0.1.5] — 2026-02-25
+
+### Fixed
+
+- **Decomposition assertion too tight on CUDA** (`tracing.py` — `_trace_firing_inner`):
+  `atol` raised from `1e-3` to `1e-2` in both correctness assertions. On CUDA,
+  `.sum()` uses a parallel tree reduction whose summation order differs from CPU's
+  sequential order. Since fp32 addition is not associative, accumulated rounding error
+  across the many terms (up to ~80k for Gemma: d_head × layers × components × tokens)
+  exceeded `atol=1e-3` even with TF32 disabled. The new value matches the existing
+  `rtol=1e-2` and is still tight enough to catch real formula or indexing errors.
+
 ## [0.1.4] — 2026-02-25
 
 ### Fixed
