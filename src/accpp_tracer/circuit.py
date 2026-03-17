@@ -6,7 +6,6 @@ building circuit graphs.
 """
 
 from collections import defaultdict
-from copy import deepcopy
 from typing import Union
 
 import networkx as nx
@@ -126,8 +125,8 @@ def get_seeds(
         device=device,
     )
     # Embedding
-    upstream_output_breakdown[0, -1, end_token_pos, end_token_pos] = deepcopy(
-        cache["blocks.0.hook_resid_pre"][prompt_idx, end_token_pos]
+    upstream_output_breakdown[0, -1, end_token_pos, end_token_pos] = (
+        cache["blocks.0.hook_resid_pre"][prompt_idx, end_token_pos].clone().detach()
     )
     for upstream_layer in range(model.cfg.n_layers):
         for upstream_ah_idx in range(model.cfg.n_heads + 3):
@@ -166,15 +165,15 @@ def get_seeds(
             elif upstream_ah_idx == model.cfg.n_heads:  # MLP
                 upstream_output_breakdown[
                     upstream_layer, upstream_ah_idx, end_token_pos, end_token_pos
-                ] = deepcopy(
+                ] = (
                     cache[f"blocks.{upstream_layer}.hook_mlp_out"][
                         prompt_idx, end_token_pos
-                    ]
+                    ].clone().detach()
                 )
             elif upstream_ah_idx == model.cfg.n_heads + 1:  # AH bias
                 upstream_output_breakdown[
                     upstream_layer, upstream_ah_idx, end_token_pos, end_token_pos
-                ] = deepcopy(model.b_O[upstream_layer])
+                ] = model.b_O[upstream_layer].clone().detach()
 
     # Layer norming the upstream outputs and projecting onto logit_direction
     contrib_end_f_W_U_tensor = (
@@ -184,7 +183,7 @@ def get_seeds(
 
     if contrib_end_f_W_U_tensor.sum() > 0:
         trace_seeds = get_upstream_contributors_seed(
-            contrib_end_f_W_U_tensor.cpu().numpy(), 1.0
+            contrib_end_f_W_U_tensor.detach().cpu().numpy(), 1.0
         )
         seeds_contrib = {
             seed: contrib_end_f_W_U_tensor[seed].item() for seed in trace_seeds
@@ -271,6 +270,7 @@ class Tracer:
         wrong_token: str | int | None = None,
         top_p: float | None = None,
         attn_weight_thresh: str | float = "dynamic",
+        compute_signals: bool = False,
     ) -> nx.MultiDiGraph:
         """Trace a single prompt (Level 3 — simplest API).
 
@@ -294,6 +294,8 @@ class Tracer:
                 nucleus / top-p definition). Each selected token becomes its own
                 direction. wrong_token is still applied if provided.
             attn_weight_thresh: "dynamic" (= 2.5/context_size) or a float in [0, 1].
+            compute_signals: If True, compute and store signal_u/signal_v tensors
+                (detached, CPU) on each non-seed edge during tracing. Default: False.
 
         Returns:
             nx.MultiDiGraph — the traced circuit graph.
@@ -374,6 +376,7 @@ class Tracer:
             root_node=root_nodes[0] if not multi else root_nodes,
             prompt_idx=0,
             attn_weight_thresh=attn_weight_thresh,
+            compute_signals=compute_signals,
         )
 
     def trace_from_cache(
@@ -385,6 +388,7 @@ class Tracer:
         root_node: tuple | list[tuple],
         prompt_idx: int = 0,
         attn_weight_thresh: str | float = "dynamic",
+        compute_signals: bool = False,
     ) -> nx.MultiDiGraph:
         """Trace from a pre-computed cache (Level 2 — advanced API).
 
@@ -408,6 +412,8 @@ class Tracer:
                 the root/output node label(s) in the graph.
             prompt_idx: Index of this prompt in the cache batch.
             attn_weight_thresh: "dynamic" or float in [0, 1].
+            compute_signals: If True, compute and store signal_u/signal_v tensors
+                (detached, CPU) on each non-seed edge during tracing. Default: False.
 
         Returns:
             nx.MultiDiGraph — the traced circuit graph. Empty if no direction
@@ -418,6 +424,24 @@ class Tracer:
         dirs = [logit_direction] if isinstance(logit_direction, Tensor) else logit_direction
         roots = [root_node] if isinstance(root_node, tuple) else root_node
 
+        return self._trace_from_cache_inner(
+            model, cache, dirs, roots, prompt_idx, end_token_pos,
+            idx_to_token, attn_weight_thresh, compute_signals,
+        )
+
+    @torch.no_grad()
+    def _trace_from_cache_inner(
+        self,
+        model,
+        cache,
+        dirs,
+        roots,
+        prompt_idx,
+        end_token_pos,
+        idx_to_token,
+        attn_weight_thresh,
+        compute_signals,
+    ):
         # Build circuit graph — shared across all directions
         G = nx.MultiDiGraph()
         is_traced: dict[tuple, int] = {}
@@ -476,6 +500,7 @@ class Tracer:
                             end_token_pos,
                             src_token,
                             attn_weight_thresh,
+                            compute_signals,
                         )
 
         return G
@@ -492,6 +517,7 @@ class Tracer:
         dest_token: int,
         src_token: int,
         attn_weight_thresh: str | float,
+        compute_signals: bool = False,
     ) -> None:
         """Recursively trace upstream contributions and build circuit graph.
 
@@ -506,6 +532,7 @@ class Tracer:
             dest_token: Destination token position.
             src_token: Source token position.
             attn_weight_thresh: "dynamic" or float.
+            compute_signals: If True, compute and attach signal_u/signal_v.
         """
         is_traced[(layer, ah_idx, dest_token, src_token)] = 1
 
@@ -597,6 +624,18 @@ class Tracer:
                     color="#E41A1C",
                 )
 
+                if compute_signals:
+                    signal_u, signal_v = self.extract_edge_signal(
+                        cache, prompt_idx,
+                        layer, ah_idx, dest_token, src_token,
+                        upstream_layer, upstream_ah_idx,
+                        dest_token, upstream_src_token,
+                        edge_type="d", svs_used=svs_used,
+                    )
+                    key = G.number_of_edges(node_upstream, node_downstream) - 1
+                    G.edges[node_upstream, node_downstream, key]["signal_u"] = signal_u.detach().cpu()
+                    G.edges[node_upstream, node_downstream, key]["signal_v"] = signal_v.detach().cpu()
+
                 if upstream_ah_idx < self.model.cfg.n_heads:
                     if (
                         upstream_layer,
@@ -615,6 +654,7 @@ class Tracer:
                             dest_token,
                             upstream_src_token,
                             attn_weight_thresh,
+                            compute_signals,
                         )
 
         # Tracing src
@@ -655,6 +695,18 @@ class Tracer:
                     color="#377EB8",
                 )
 
+                if compute_signals:
+                    signal_u, signal_v = self.extract_edge_signal(
+                        cache, prompt_idx,
+                        layer, ah_idx, dest_token, src_token,
+                        upstream_layer, upstream_ah_idx,
+                        src_token, upstream_src_token,
+                        edge_type="s", svs_used=svs_used,
+                    )
+                    key = G.number_of_edges(node_upstream, node_downstream) - 1
+                    G.edges[node_upstream, node_downstream, key]["signal_u"] = signal_u.detach().cpu()
+                    G.edges[node_upstream, node_downstream, key]["signal_v"] = signal_v.detach().cpu()
+
                 if upstream_ah_idx < self.model.cfg.n_heads:
                     if (
                         upstream_layer,
@@ -673,6 +725,7 @@ class Tracer:
                             src_token,
                             upstream_src_token,
                             attn_weight_thresh,
+                            compute_signals,
                         )
 
     def extract_edge_signal(
