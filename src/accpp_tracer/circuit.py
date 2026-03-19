@@ -6,7 +6,7 @@ building circuit graphs.
 """
 
 from collections import defaultdict
-from typing import Union
+from typing import Callable, Union
 
 import networkx as nx
 import numpy as np
@@ -207,6 +207,8 @@ class Tracer:
         device: Torch device. If None, uses model's device.
         use_numpy_svd: Use numpy for SVD (more stable for some models
             like Pythia). Default: False.
+        dynamic_threshold_scale: Numerator for the "dynamic" attention weight
+            threshold formula: min(1.0, scale / (dest_token + 1)). Default: 2.5.
 
     Example:
         >>> from accpp_tracer import Tracer
@@ -225,10 +227,12 @@ class Tracer:
         model: HookedTransformer,
         device: str | None = None,
         use_numpy_svd: bool = False,
+        dynamic_threshold_scale: float = 2.5,
     ) -> None:
         self.model = model
         self.device = device or str(model.cfg.device)
         self.config = get_model_config(model, use_numpy_svd=use_numpy_svd)
+        self.dynamic_threshold_scale = dynamic_threshold_scale
 
         # Disable TF32 on CUDA. Ampere+ GPUs use TF32 by default for
         # matmul (10 mantissa bits vs 23 for fp32), causing accumulated rounding
@@ -269,8 +273,9 @@ class Tracer:
         answer_token: str | int | list[str | int] | None = None,
         wrong_token: str | int | None = None,
         top_p: float | None = None,
-        attn_weight_thresh: str | float = "dynamic",
+        attn_weight_thresh: str | float | Callable[[int], float] = "dynamic",
         compute_signals: bool = False,
+        prepend_bos: bool | None = None,
     ) -> nx.MultiDiGraph:
         """Trace a single prompt (Level 3 — simplest API).
 
@@ -293,9 +298,13 @@ class Tracer:
                 set of top tokens whose cumulative probability >= top_p (standard
                 nucleus / top-p definition). Each selected token becomes its own
                 direction. wrong_token is still applied if provided.
-            attn_weight_thresh: "dynamic" (= 2.5/context_size) or a float in [0, 1].
+            attn_weight_thresh: "dynamic" (= scale/context_size, where scale is
+                dynamic_threshold_scale from __init__), a float in [0, 1], or a
+                callable that takes dest_token position (int) and returns a float.
             compute_signals: If True, compute and store signal_u/signal_v tensors
                 (detached, CPU) on each non-seed edge during tracing. Default: False.
+            prepend_bos: Whether to prepend BOS token. None (default) uses
+                TransformerLens's model default. True/False overrides explicitly.
 
         Returns:
             nx.MultiDiGraph — the traced circuit graph.
@@ -303,7 +312,10 @@ class Tracer:
         model = self.model
 
         # Tokenize
-        tokens = model.to_tokens(prompt)  # shape: (1, seq_len)
+        if prepend_bos is not None:
+            tokens = model.to_tokens(prompt, prepend_bos=prepend_bos)  # shape: (1, seq_len)
+        else:
+            tokens = model.to_tokens(prompt)  # shape: (1, seq_len)
         end_token_pos = tokens.shape[1] - 1
 
         # Forward pass — logits needed for top_p
@@ -387,7 +399,7 @@ class Tracer:
         idx_to_token: dict[int, str],
         root_node: tuple | list[tuple],
         prompt_idx: int = 0,
-        attn_weight_thresh: str | float = "dynamic",
+        attn_weight_thresh: str | float | Callable[[int], float] = "dynamic",
         compute_signals: bool = False,
     ) -> nx.MultiDiGraph:
         """Trace from a pre-computed cache (Level 2 — advanced API).
@@ -411,7 +423,8 @@ class Tracer:
             root_node: Single tuple or list of tuples (one per direction) for
                 the root/output node label(s) in the graph.
             prompt_idx: Index of this prompt in the cache batch.
-            attn_weight_thresh: "dynamic" or float in [0, 1].
+            attn_weight_thresh: "dynamic" (= scale/context_size), a float in
+                [0, 1], or a callable taking dest_token position → float.
             compute_signals: If True, compute and store signal_u/signal_v tensors
                 (detached, CPU) on each non-seed edge during tracing. Default: False.
 
@@ -516,7 +529,7 @@ class Tracer:
         ah_idx: int,
         dest_token: int,
         src_token: int,
-        attn_weight_thresh: str | float,
+        attn_weight_thresh: str | float | Callable[[int], float],
         compute_signals: bool = False,
     ) -> None:
         """Recursively trace upstream contributions and build circuit graph.
@@ -531,7 +544,7 @@ class Tracer:
             ah_idx: Attention head index.
             dest_token: Destination token position.
             src_token: Source token position.
-            attn_weight_thresh: "dynamic" or float.
+            attn_weight_thresh: "dynamic", float, or callable(dest_token) -> float.
             compute_signals: If True, compute and attach signal_u/signal_v.
         """
         is_traced[(layer, ah_idx, dest_token, src_token)] = 1
@@ -543,18 +556,21 @@ class Tracer:
             return
 
         if attn_weight_thresh == "dynamic":
-            attn_weight_thresh_eval = min(1.0, 2.5 / (dest_token + 1))
+            attn_weight_thresh_eval = min(
+                1.0, self.dynamic_threshold_scale / (dest_token + 1)
+            )
+        elif callable(attn_weight_thresh):
+            attn_weight_thresh_eval = attn_weight_thresh(dest_token)
         else:
             attn_weight_thresh_eval = float(attn_weight_thresh)
 
         assert 0.0 <= attn_weight_thresh_eval <= 1.0
 
-        if (
-            cache[f"blocks.{layer}.attn.hook_pattern"][
-                prompt_idx, ah_idx, dest_token, src_token
-            ].item()
-            < attn_weight_thresh_eval
-        ):
+        attn_weight = cache[f"blocks.{layer}.attn.hook_pattern"][
+            prompt_idx, ah_idx, dest_token, src_token
+        ].item()
+
+        if attn_weight < attn_weight_thresh_eval:
             return
 
         svs_dest, edge_weights_dest, svs_src, edge_weights_src = trace_firing(
@@ -585,6 +601,11 @@ class Tracer:
             idx_to_token[dest_token],
             idx_to_token[src_token],
         )
+
+        # Store the attention weight on the AH firing node
+        if node_downstream not in G:
+            G.add_node(node_downstream)
+        G.nodes[node_downstream]["attn_weight"] = attn_weight
 
         # Tracing dest
         for (
@@ -623,6 +644,19 @@ class Tracer:
                     type="d",
                     color="#E41A1C",
                 )
+
+                # Set attn_weight on upstream AH nodes (may be leaf nodes
+                # that _trace_recursive won't visit, e.g. layer 0)
+                if (
+                    upstream_ah_idx < self.model.cfg.n_heads
+                    and "attn_weight" not in G.nodes[node_upstream]
+                ):
+                    G.nodes[node_upstream]["attn_weight"] = cache[
+                        f"blocks.{upstream_layer}.attn.hook_pattern"
+                    ][
+                        prompt_idx, upstream_ah_idx,
+                        dest_token, upstream_src_token,
+                    ].item()
 
                 if compute_signals:
                     signal_u, signal_v = self.extract_edge_signal(
@@ -694,6 +728,19 @@ class Tracer:
                     type="s",
                     color="#377EB8",
                 )
+
+                # Set attn_weight on upstream AH nodes (may be leaf nodes
+                # that _trace_recursive won't visit, e.g. layer 0)
+                if (
+                    upstream_ah_idx < self.model.cfg.n_heads
+                    and "attn_weight" not in G.nodes[node_upstream]
+                ):
+                    G.nodes[node_upstream]["attn_weight"] = cache[
+                        f"blocks.{upstream_layer}.attn.hook_pattern"
+                    ][
+                        prompt_idx, upstream_ah_idx,
+                        src_token, upstream_src_token,
+                    ].item()
 
                 if compute_signals:
                     signal_u, signal_v = self.extract_edge_signal(
