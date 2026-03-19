@@ -301,8 +301,10 @@ class Tracer:
             attn_weight_thresh: "dynamic" (= scale/context_size, where scale is
                 dynamic_threshold_scale from __init__), a float in [0, 1], or a
                 callable that takes dest_token position (int) and returns a float.
-            compute_signals: If True, compute and store signal_u/signal_v tensors
-                (detached, CPU) on each non-seed edge during tracing. Default: False.
+            compute_signals: If True, compute and store a signal tensor
+                (detached, CPU) on each non-seed edge during tracing: signal_u
+                for destination edges, signal_v for source edges, keyed as
+                "signal". Default: False.
             prepend_bos: Whether to prepend BOS token. None (default) uses
                 TransformerLens's model default. True/False overrides explicitly.
 
@@ -425,8 +427,10 @@ class Tracer:
             prompt_idx: Index of this prompt in the cache batch.
             attn_weight_thresh: "dynamic" (= scale/context_size), a float in
                 [0, 1], or a callable taking dest_token position → float.
-            compute_signals: If True, compute and store signal_u/signal_v tensors
-                (detached, CPU) on each non-seed edge during tracing. Default: False.
+            compute_signals: If True, compute and store a signal tensor
+                (detached, CPU) on each non-seed edge during tracing: signal_u
+                for destination edges, signal_v for source edges, keyed as
+                "signal". Default: False.
 
         Returns:
             nx.MultiDiGraph — the traced circuit graph. Empty if no direction
@@ -545,7 +549,7 @@ class Tracer:
             dest_token: Destination token position.
             src_token: Source token position.
             attn_weight_thresh: "dynamic", float, or callable(dest_token) -> float.
-            compute_signals: If True, compute and attach signal_u/signal_v.
+            compute_signals: If True, attach "signal" (signal_u for dest, signal_v for src edges).
         """
         is_traced[(layer, ah_idx, dest_token, src_token)] = 1
 
@@ -667,8 +671,7 @@ class Tracer:
                         edge_type="d", svs_used=svs_used,
                     )
                     key = G.number_of_edges(node_upstream, node_downstream) - 1
-                    G.edges[node_upstream, node_downstream, key]["signal_u"] = signal_u.detach().cpu()
-                    G.edges[node_upstream, node_downstream, key]["signal_v"] = signal_v.detach().cpu()
+                    G.edges[node_upstream, node_downstream, key]["signal"] = signal_u.detach().cpu()
 
                 if upstream_ah_idx < self.model.cfg.n_heads:
                     if (
@@ -751,8 +754,7 @@ class Tracer:
                         edge_type="s", svs_used=svs_used,
                     )
                     key = G.number_of_edges(node_upstream, node_downstream) - 1
-                    G.edges[node_upstream, node_downstream, key]["signal_u"] = signal_u.detach().cpu()
-                    G.edges[node_upstream, node_downstream, key]["signal_v"] = signal_v.detach().cpu()
+                    G.edges[node_upstream, node_downstream, key]["signal"] = signal_v.detach().cpu()
 
                 if upstream_ah_idx < self.model.cfg.n_heads:
                     if (
