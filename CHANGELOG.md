@@ -2,6 +2,206 @@
 
 All notable changes to `accpp-tracer` are documented here.
 
+## [0.2.2] — 2026-06-05
+
+Intervention API redesign — same math, ground-truth structure. Replaces the
+0.2.1 `compute_edge_intervention()` + `intervene()` pair with a single
+`Tracer.run_intervention()` method whose body mirrors the ground-truth
+`run_intervention()` function in `new-code/experiments/interventions.py`
+step-by-step. The signal computation (project → center → divide-by-LN) is now
+**inlined explicitly** rather than dispatched through
+`extract_edge_signal(flavor="normalized")` + `get_component_output(ln_normalize=True)`,
+making the math directly auditable against the verified ground truth.
+
+### Breaking changes
+
+- **`Tracer.compute_edge_intervention()`** removed.
+- **`Tracer.intervene()`** removed.
+- **`Tracer._global_hook_name()`** removed (replaced by module-level
+  `_global_hook_name()` helper).
+- **`accpp_tracer.intervention` module**: the module-level hook helper names
+  (`_local_q_hook`, `_local_k_hook`, `_global_residual_hook`) moved from
+  `circuit.py` (they were already private; mention only for completeness).
+
+### Added
+
+- **`Tracer.run_intervention()`** (`circuit.py`): single-edge,
+  single-prompt-targeted intervention. Takes one `EdgeSpec`, the clean
+  `tokens` / `cache` / `logits`, a `prompt_idx`, and an `intervention_type`
+  (`"local"` or `"global"`); returns an `InterventionResult` dataclass.
+  Math flow follows the ground truth's Steps 1–7 verbatim:
+  1. Get singular-vector indices (from `EdgeSpec.svs_used`).
+  2. Build the projection `P = B_s @ B_s.T`.
+  3. Compute the upstream component output (case dispatch by
+     `upstream_component_id`: AH → `A * V @ W_O` with optional Gemma post-attn
+     LN; MLP → `hook_mlp_out`; AH bias → `b_O`; embedding → `hook_resid_pre`;
+     AH offset → `c_d @ M_d` / `M_s @ c_s` with RoPE at the intervention
+     position).
+  3.1. `signal = upstream_out @ P`.
+  3.2. Center (LN-pre / LN only; auto-detected from `normalization_type`).
+  3.3. Divide by `ln1.hook_scale[pos_interv]` (local only).
+  3.4. Write into the delta tensor at `(prompt_idx, pos_interv, :)`.
+  4. Run the model via `_run_local_intervention()` (Q/K hook + recompute)
+     or `_run_global_intervention()` (residual hook).
+  6. Compute `norm_ratio` / `cos_sim` at the intervention position.
+  7. Compute `attn_scores_clean` / `attn_scores_interv` at the downstream
+     head's `(dest, src)` cell.
+
+- **`Tracer._run_local_intervention()`** (private helper): mirrors
+  `run_local_intervention()` from the ground truth. Builds `q_interv` (for
+  `"d"`) or `k_interv` (for `"s"`) via `F.linear`, installs the
+  `hook_q` / `hook_k` patch hook, and runs `model.run_with_cache(tokens)` in
+  a `model.hooks(...)` context for clean teardown.
+
+- **`Tracer._run_global_intervention()`** (private helper): mirrors
+  `run_global_intervention()` from the ground truth. Installs an
+  add/subtract hook on `hook_attn_out` (AH / AH bias), `hook_mlp_out` (MLP),
+  or `blocks.0.hook_resid_pre` (embedding); runs with cache.
+
+- **`InterventionResult`** dataclass (`intervention.py`): carries
+  `logits_clean`, `logits_interv`, `interv_cache`, `delta`, `norm_ratio`,
+  `cos_sim`, `attn_scores_clean`, `attn_scores_interv`. All per-prompt
+  metrics are tensors of shape `(n_prompts,)`; only the entry at the
+  targeted `prompt_idx` is affected by the intervention.
+
+### Notes
+
+- **No math change vs. 0.2.1**: the underlying computation
+  (project → center → divide-by-LN, with the AH offset rotation exception)
+  is the same. The change is structural: inlined and laid out to match the
+  verified ground truth, with explicit Step 1–7 comments. The signal
+  computation no longer goes through `extract_edge_signal` /
+  `get_component_output`, so the intervention path can be audited
+  independently of the autointerp signal API.
+- **`extract_edge_signal()` and `extract_edge_signal_pair_autointerp()`**
+  are unchanged. They remain the entry points for the autointerp signal
+  flavors (`rotated_normalized`, `normalized`, `raw`).
+- **API trade-off**: 0.2.1's batched `intervene(edges: list[EdgeSpec])`
+  is replaced by single-edge `run_intervention(edge: EdgeSpec)`. Multi-edge
+  experiments now loop in caller code (one forward pass per edge),
+  matching the ground truth's iteration pattern.
+
+## [0.2.1] — 2026-06-04
+
+Causal intervention API (item 1 of the `interventions_api` branch). Extracts the
+task-agnostic core of `new-code/experiments/interventions.py` (~850 lines)
+into a library feature so users can ablate or boost individual circuit edges
+without re-implementing the math each time. Builds directly on the signal
+flavors introduced in 0.2.0 (`"normalized"` for local, `"raw"` for global).
+
+### Added
+
+- **`accpp_tracer.intervention` module** (new):
+  - `EdgeSpec` — frozen dataclass holding a fully-resolved circuit edge
+    specification (integer token positions, component ID, edge type, list of
+    singular-vector indices).
+  - `edges_from_graph(graph, token_to_idx, n_heads, edges=None)` — parses
+    graph edges produced by `Tracer.trace()` into `EdgeSpec` objects. Skips
+    root / output edges automatically.
+
+- **`Tracer.compute_edge_intervention()`** (`circuit.py`): returns the
+  per-target delta tensors that an intervention would apply, without
+  running the model. Useful for inspection / debugging.
+
+- **`Tracer.intervene()`** (`circuit.py`): runs the model with intervention
+  hooks. Two modes:
+  - `intervention_type="local"`: modifies the LN-normalized attention input,
+    recomputes Q (for `"d"` edges) or K (for `"s"` edges), and hooks
+    `hook_q` / `hook_k` for the targeted head only. Surgical.
+  - `intervention_type="global"`: modifies the upstream component's output
+    in the residual stream via `hook_attn_out` / `hook_mlp_out` /
+    `hook_resid_pre`. Broader effect.
+
+  AH offset + global is unsupported (no hook point exists for a
+  bias-projection term) and raises `ValueError`. Edges are applied
+  cumulatively in a single forward pass; per-target deltas accumulate.
+
+### Notes
+
+- **Signal flavor mapping**: local intervention consumes
+  `flavor="normalized"` (LN-normalized, unrotated except AH offset); global
+  intervention consumes `flavor="raw"` (residual-stream-space, unrotated
+  except AH offset).
+- **Centering policy**: auto-detected from `model.cfg.normalization_type`.
+  `LN`/`LNPre` (GPT-2, Pythia) → center; `RMS`/`RMSPre` (Gemma-2) → don't.
+  Override via `center=True/False`.
+- **GQA support**: K-hook indexing uses `ah_idx // config.gqa_repeats` for
+  Gemma-2-2b (n_kv_heads < n_heads); transparent on non-GQA models.
+- **Backward-compatible numerics**: the delta tensors match (within fp32
+  rounding) what `new-code/experiments/interventions.py:run_intervention()`
+  produces on the same inputs.
+
+## [0.2.0] — 2026-06-04
+
+Breaking signal-API redesign. Three signal "flavors" are now first-class citizens
+of the library, addressing the fact that analysis (autointerp), causal intervention,
+and MLP upstream tracing each need the per-edge signal in a *different* space.
+
+### Breaking changes
+
+- **`Tracer.extract_edge_signal()`** (`circuit.py`):
+  - Now requires a keyword argument ``flavor: Literal["rotated_normalized",
+    "normalized", "raw"]`` (no default). The three values map to:
+    - ``"rotated_normalized"`` — LN-normalized + RoPE-rotated (analysis / autointerp
+      flavor; matches pre-0.2.0 behavior).
+    - ``"normalized"`` — LN-normalized, unrotated (intervention flavor).
+    - ``"raw"`` — raw residual-stream-space output (MLP upstream tracing flavor).
+  - Return type changed from ``tuple[Tensor, Tensor]`` (``(signal_u, signal_v)``)
+    to a single ``Tensor`` — the **primary** signal matching the edge type
+    (``signal_u`` for ``edge_type="d"``, ``signal_v`` for ``edge_type="s"``).
+    The complementary (cross-projected) signal is no longer computed here.
+  - **AH offset structural exception**: ``c_d`` / ``c_s`` never see LN division
+    (regardless of flavor), and are rotated in ``"rotated_normalized"`` and
+    ``"normalized"`` but not in ``"raw"``. This matches the old code path for
+    AH offset under intervention (rotation required) and keeps autointerp
+    behavior identical.
+
+- **`Tracer.trace()` / `Tracer.trace_from_cache()`** (`circuit.py`):
+  - ``compute_signals: bool = False`` was REMOVED and replaced with
+    ``signals: Literal[None, "rotated_normalized", "normalized", "raw"] = None``.
+    When non-None, the primary signal in that flavor is attached to each
+    non-seed edge under the key ``"signal"``, along with a new
+    ``"signal_flavor"`` attribute recording which flavor was stored.
+  - Migration: ``compute_signals=True`` → ``signals="rotated_normalized"`` for
+    byte-identical edge values to the pre-0.2.0 path.
+  - The graph stores **one signal per edge** (the primary, matching edge type).
+    Pre-0.2.0 also stored one per edge, so no storage-layout change.
+
+### Added
+
+- **`Tracer.extract_edge_signal_pair_autointerp()`** (`circuit.py`): new method
+  returning the ``(signal_u, signal_v)`` pair for autointerp use cases — the
+  paper interprets both U-side and V-side of an SVD-paired channel.
+  ``flavor`` defaults to ``"rotated_normalized"`` (the autointerp flavor). The
+  method computes the primary via ``extract_edge_signal()`` and cross-projects
+  through Omega for the complement.
+
+- **`get_component_output()`** (`signals.py`): new keyword ``ln_normalize:
+  bool = True`` controlling whether the output is divided by the downstream LN
+  scale. AH offset is unaffected (never had LN division). Existing callers
+  without the flag continue to get the prior behavior.
+
+### Notes on AH offset
+
+AH offset (``upstream_component_id == n_heads + 3``) is the lone structural
+carve-out from the otherwise orthogonal flag scheme. The intervention path
+requires AH offset to be rotated even when other components are not, because
+``c_d`` / ``c_s`` live in pseudo-d_model space. This is encoded inside
+``extract_edge_signal()`` (see ``rotate_offset`` vs ``rotate_non_offset``).
+
+### Migration guide for existing callers
+
+| Pre-0.2.0 call                                              | 0.2.0 call                                                            |
+|-------------------------------------------------------------|-----------------------------------------------------------------------|
+| ``tracer.trace(..., compute_signals=True)``                 | ``tracer.trace(..., signals="rotated_normalized")``                   |
+| ``tracer.trace(..., compute_signals=False)``                | ``tracer.trace(...)`` (default ``signals=None``)                      |
+| ``u, v = tracer.extract_edge_signal(...)``                  | ``u, v = tracer.extract_edge_signal_pair_autointerp(...)``            |
+| (analysis flavor only, primary signal)                       | ``signal = tracer.extract_edge_signal(..., flavor="rotated_normalized")`` |
+
+External experiment scripts (`new-code/experiments/extract_signals.py`) need
+to migrate to the new pair method; that change ships in the paper repo, not
+this library.
+
 ## [0.1.5] — 2026-02-25
 
 ### Fixed

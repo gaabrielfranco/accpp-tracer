@@ -6,7 +6,7 @@ building circuit graphs.
 """
 
 from collections import defaultdict
-from typing import Callable, Union
+from typing import Callable, Literal, Union
 
 import networkx as nx
 import numpy as np
@@ -17,7 +17,16 @@ from transformer_lens import HookedTransformer, ActivationCache
 
 from einops import einsum
 
+from functools import partial   # CHANGED: needed for intervention hooks
+
+import torch.nn.functional as F
+
 from .decomposition import compute_weight_pseudoinverses, get_omega_decomposition
+from .intervention import (   # CHANGED: intervention API
+    EdgeSpec,
+    InterventionResult,
+    _should_center,
+)
 from .models import get_model_config, ModelConfig
 from .rope import get_rotation_matrix
 from .signals import get_component_output
@@ -274,7 +283,7 @@ class Tracer:
         wrong_token: str | int | None = None,
         top_p: float | None = None,
         attn_weight_thresh: str | float | Callable[[int], float] = "dynamic",
-        compute_signals: bool = False,
+        signals: Literal[None, "rotated_normalized", "normalized", "raw"] = None,
         prepend_bos: bool | None = None,
     ) -> nx.MultiDiGraph:
         """Trace a single prompt (Level 3 — simplest API).
@@ -301,10 +310,18 @@ class Tracer:
             attn_weight_thresh: "dynamic" (= scale/context_size, where scale is
                 dynamic_threshold_scale from __init__), a float in [0, 1], or a
                 callable that takes dest_token position (int) and returns a float.
-            compute_signals: If True, compute and store a signal tensor
-                (detached, CPU) on each non-seed edge during tracing: signal_u
-                for destination edges, signal_v for source edges, keyed as
-                "signal". Default: False.
+            signals: If non-None, compute and store the **primary** signal tensor
+                (detached, CPU) on each non-seed edge during tracing, in the
+                requested flavor. The signal of a dest edge is ``signal_u``; the
+                signal of a src edge is ``signal_v``. Each edge also gains a
+                ``"signal_flavor"`` attribute matching this value. Default:
+                ``None`` (no signals stored). One of:
+
+                  - ``"rotated_normalized"`` — analysis / autointerp flavor (QK frame)
+                  - ``"normalized"`` — intervention flavor (LN-normalized, unrotated)
+                  - ``"raw"`` — residual-stream-space flavor (MLP upstream tracing)
+
+                See :meth:`extract_edge_signal` for the full flavor semantics.
             prepend_bos: Whether to prepend BOS token. None (default) uses
                 TransformerLens's model default. True/False overrides explicitly.
 
@@ -390,7 +407,7 @@ class Tracer:
             root_node=root_nodes[0] if not multi else root_nodes,
             prompt_idx=0,
             attn_weight_thresh=attn_weight_thresh,
-            compute_signals=compute_signals,
+            signals=signals,
         )
 
     def trace_from_cache(
@@ -402,7 +419,7 @@ class Tracer:
         root_node: tuple | list[tuple],
         prompt_idx: int = 0,
         attn_weight_thresh: str | float | Callable[[int], float] = "dynamic",
-        compute_signals: bool = False,
+        signals: Literal[None, "rotated_normalized", "normalized", "raw"] = None,
     ) -> nx.MultiDiGraph:
         """Trace from a pre-computed cache (Level 2 — advanced API).
 
@@ -427,10 +444,14 @@ class Tracer:
             prompt_idx: Index of this prompt in the cache batch.
             attn_weight_thresh: "dynamic" (= scale/context_size), a float in
                 [0, 1], or a callable taking dest_token position → float.
-            compute_signals: If True, compute and store a signal tensor
-                (detached, CPU) on each non-seed edge during tracing: signal_u
-                for destination edges, signal_v for source edges, keyed as
-                "signal". Default: False.
+            signals: If non-None, compute and store the **primary** signal tensor
+                (detached, CPU) on each non-seed edge during tracing, in the
+                requested flavor. The signal of a dest edge is ``signal_u``; the
+                signal of a src edge is ``signal_v``. Each edge also gains a
+                ``"signal_flavor"`` attribute matching this value. One of
+                ``"rotated_normalized" / "normalized" / "raw"``. Default:
+                ``None`` (no signals stored). See :meth:`extract_edge_signal` for
+                the full flavor semantics.
 
         Returns:
             nx.MultiDiGraph — the traced circuit graph. Empty if no direction
@@ -443,7 +464,7 @@ class Tracer:
 
         return self._trace_from_cache_inner(
             model, cache, dirs, roots, prompt_idx, end_token_pos,
-            idx_to_token, attn_weight_thresh, compute_signals,
+            idx_to_token, attn_weight_thresh, signals,
         )
 
     @torch.no_grad()
@@ -457,7 +478,7 @@ class Tracer:
         end_token_pos,
         idx_to_token,
         attn_weight_thresh,
-        compute_signals,
+        signals,
     ):
         # Build circuit graph — shared across all directions
         G = nx.MultiDiGraph()
@@ -517,7 +538,7 @@ class Tracer:
                             end_token_pos,
                             src_token,
                             attn_weight_thresh,
-                            compute_signals,
+                            signals,
                         )
 
         return G
@@ -534,7 +555,7 @@ class Tracer:
         dest_token: int,
         src_token: int,
         attn_weight_thresh: str | float | Callable[[int], float],
-        compute_signals: bool = False,
+        signals: Literal[None, "rotated_normalized", "normalized", "raw"] = None,
     ) -> None:
         """Recursively trace upstream contributions and build circuit graph.
 
@@ -549,7 +570,9 @@ class Tracer:
             dest_token: Destination token position.
             src_token: Source token position.
             attn_weight_thresh: "dynamic", float, or callable(dest_token) -> float.
-            compute_signals: If True, attach "signal" (signal_u for dest, signal_v for src edges).
+            signals: When non-None, attach the primary signal (in the requested
+                flavor) to each non-seed edge under the key ``"signal"``, plus a
+                ``"signal_flavor"`` attribute recording which flavor was stored.
         """
         is_traced[(layer, ah_idx, dest_token, src_token)] = 1
 
@@ -662,16 +685,18 @@ class Tracer:
                         dest_token, upstream_src_token,
                     ].item()
 
-                if compute_signals:
-                    signal_u, signal_v = self.extract_edge_signal(
+                if signals is not None:
+                    signal = self.extract_edge_signal(
                         cache, prompt_idx,
                         layer, ah_idx, dest_token, src_token,
                         upstream_layer, upstream_ah_idx,
                         dest_token, upstream_src_token,
                         edge_type="d", svs_used=svs_used,
+                        flavor=signals,
                     )
                     key = G.number_of_edges(node_upstream, node_downstream) - 1
-                    G.edges[node_upstream, node_downstream, key]["signal"] = signal_u.detach().cpu()
+                    G.edges[node_upstream, node_downstream, key]["signal"] = signal.detach().cpu()
+                    G.edges[node_upstream, node_downstream, key]["signal_flavor"] = signals
 
                 if upstream_ah_idx < self.model.cfg.n_heads:
                     if (
@@ -691,7 +716,7 @@ class Tracer:
                             dest_token,
                             upstream_src_token,
                             attn_weight_thresh,
-                            compute_signals,
+                            signals,
                         )
 
         # Tracing src
@@ -745,16 +770,18 @@ class Tracer:
                         src_token, upstream_src_token,
                     ].item()
 
-                if compute_signals:
-                    signal_u, signal_v = self.extract_edge_signal(
+                if signals is not None:
+                    signal = self.extract_edge_signal(
                         cache, prompt_idx,
                         layer, ah_idx, dest_token, src_token,
                         upstream_layer, upstream_ah_idx,
                         src_token, upstream_src_token,
                         edge_type="s", svs_used=svs_used,
+                        flavor=signals,
                     )
                     key = G.number_of_edges(node_upstream, node_downstream) - 1
-                    G.edges[node_upstream, node_downstream, key]["signal"] = signal_v.detach().cpu()
+                    G.edges[node_upstream, node_downstream, key]["signal"] = signal.detach().cpu()
+                    G.edges[node_upstream, node_downstream, key]["signal_flavor"] = signals
 
                 if upstream_ah_idx < self.model.cfg.n_heads:
                     if (
@@ -774,7 +801,7 @@ class Tracer:
                             src_token,
                             upstream_src_token,
                             attn_weight_thresh,
-                            compute_signals,
+                            signals,
                         )
 
     def extract_edge_signal(
@@ -791,31 +818,54 @@ class Tracer:
         upstream_src_token: int,
         edge_type: str,
         svs_used: list[int],
-    ) -> tuple[Tensor, Tensor]:
-        """Extract signal pair (signal_u, signal_v) for a single circuit edge.
+        *,
+        flavor: Literal["rotated_normalized", "normalized", "raw"],
+    ) -> Tensor:
+        """Extract the signal of a single circuit edge in the requested flavor.
 
-        Given an edge in a traced ACC++ circuit graph, computes the destination
-        and source signal vectors by:
+        Returns the **primary** signal of the edge:
 
-        1. Extracting the upstream component's output (normalized by downstream LN)
-        2. Applying RoPE rotation if the model uses rotary embeddings
-        3. Projecting onto the relevant singular vector subspace
-        4. Cross-projecting through Omega to get the complementary signal
+        - ``edge_type="d"`` → ``signal_u`` (in the U / destination / query side)
+        - ``edge_type="s"`` → ``signal_v`` (in the V / source / key side)
 
-        The returned signals are UNNORMALIZED. Normalize at load time if needed
-        (e.g., signal / signal.norm() for unit-norm signals).
+        For the autointerp use case where both U-side and V-side characterize the
+        SVD communication channel, use :meth:`extract_edge_signal_pair_autointerp`.
 
-        Math summary (see paper Appendix B, C):
+        The ``flavor`` argument controls which space the signal lives in:
 
-        For destination edges (edge_type="d"):
-            rotation:  transformed = x @ W_Q[l,h] @ R[dest].T @ W_Q_pinv[l,h]
-            projection: signal_u = P_U @ transformed   (P_U = U[:,svs] @ U[:,svs].T)
-            cross-proj: signal_v = Omega.T @ signal_u   (via U, S, VT — no full matrix)
+        ============================  ==========  ==============  =================================
+        flavor                        rotate?     LN-normalize?   intended use
+        ============================  ==========  ==============  =================================
+        ``"rotated_normalized"``      yes         yes             analysis / autointerp (QK frame)
+        ``"normalized"``              no (*)      yes             causal intervention
+        ``"raw"``                     no          no              MLP upstream tracing
+        ============================  ==========  ==============  =================================
 
-        For source edges (edge_type="s"):
-            rotation:  transformed = W_K_pinv[l,h].T @ R[src] @ W_K[l,h].T @ x
-            projection: signal_v = P_V @ transformed   (P_V = VT[svs,:].T @ VT[svs,:])
-            cross-proj: signal_u = Omega @ signal_v     (via U, S, VT — no full matrix)
+        (*) **AH offset is the structural exception.** ``c_d`` / ``c_s`` are
+        precomputed bias projections that live in pseudo-d_model space; they
+        never see LN division, and they are rotated even in the ``"normalized"``
+        flavor because intervention requires it. They are NOT rotated in the
+        ``"raw"`` flavor.
+
+        The returned signal is UNNORMALIZED in magnitude. Apply
+        ``signal / signal.norm()`` at the call site if unit-norm vectors are
+        needed (e.g., for autointerp).
+
+        Math summary (see paper Appendix B, C). With
+        :math:`P_U = U[:,\\mathrm{svs}] U[:,\\mathrm{svs}]^T` and
+        :math:`P_V = V_T[\\mathrm{svs},:]^T V_T[\\mathrm{svs},:]`:
+
+        For destination edges (``edge_type="d"``):
+
+        - rotated:   :math:`\\tilde x = x \\, W_Q[l,h] \\, R^T \\, W_Q^{+}[l,h]`
+        - unrotated: :math:`\\tilde x = x`
+        - signal:    :math:`s_u = P_U \\, \\tilde x`
+
+        For source edges (``edge_type="s"``):
+
+        - rotated:   :math:`\\tilde x = W_K^{+}[l,h]^T \\, R \\, W_K[l,h]^T \\, x`
+        - unrotated: :math:`\\tilde x = x`
+        - signal:    :math:`s_v = P_V \\, \\tilde x`
 
         Args:
             cache: Activation cache from model.run_with_cache().
@@ -830,14 +880,38 @@ class Tracer:
             upstream_src_token: Src position of the upstream component.
             edge_type: "d" for destination (query) edge, "s" for source (key).
             svs_used: List of singular vector indices used by this edge.
+            flavor: REQUIRED. One of ``"rotated_normalized"``, ``"normalized"``,
+                or ``"raw"``. There is no default — the three flavors are
+                semantically distinct and callers must choose explicitly.
 
         Returns:
-            (signal_u, signal_v) tuple where:
-                signal_u: Signal in the U (query/dest) space, shape (d_model,).
-                signal_v: Signal in the V (key/source) space, shape (d_model,).
+            The primary signal in d_model space:
+                - ``signal_u`` for dest edges (``edge_type="d"``)
+                - ``signal_v`` for src edges (``edge_type="s"``)
         """
+        if flavor == "rotated_normalized":
+            ln_normalize = True
+            rotate_non_offset = True
+            rotate_offset = True
+        elif flavor == "normalized":
+            ln_normalize = True
+            rotate_non_offset = False
+            rotate_offset = True   # structural exception: intervention requires rotation
+        elif flavor == "raw":
+            ln_normalize = False
+            rotate_non_offset = False
+            rotate_offset = False
+        else:
+            raise ValueError(
+                f"Unknown flavor: {flavor!r}. Must be one of "
+                '"rotated_normalized", "normalized", "raw".'
+            )
+
         l = downstream_layer
         h = downstream_ah_idx
+        n_heads = self.model.cfg.n_heads
+        is_ah_offset = (upstream_component_id == n_heads + 3)
+        do_rotate = rotate_offset if is_ah_offset else rotate_non_offset
 
         # --- Step 1: Get upstream component output ---
         c_term = self.c_d if edge_type == "d" else self.c_s
@@ -847,13 +921,14 @@ class Tracer:
             upstream_dest_token, upstream_src_token,
             upstream_layer, upstream_component_id,
             c_term,
+            ln_normalize=ln_normalize,
         )
 
-        # --- Step 2: Apply RoPE rotation (if applicable) ---
+        # --- Step 2: Apply RoPE rotation (if applicable AND requested) ---
         # Per-edge approach: compute rotation for a single position, avoiding
         # precomputation of full M_d_all / M_s_all tensors (which would be
         # ~88 GB for Gemma). Three mat-vec products through d_head space.
-        if self.config.has_rope:
+        if self.config.has_rope and do_rotate:
             # Rotation position: upstream_dest_token for both edge types.
             # For dest edges: upstream_dest_token == downstream_dest_token.
             # For src edges: upstream_dest_token == downstream_src_token.
@@ -889,35 +964,557 @@ class Tracer:
         else:
             transformed = x
 
-        # --- Step 3: Project onto singular vector subspace ---
+        # --- Step 3: Project onto singular vector subspace and return PRIMARY ---
         if edge_type == "d":
             # Project onto U subspace (destination/query side)
             # P_U @ transformed = U[:,svs] @ (U[:,svs].T @ transformed)
             U_svs = self.U[l, h, :, svs_used]  # (d_model, n_svs)
             signal_u = U_svs @ (U_svs.T @ transformed)  # (d_model,)
-
-            # --- Step 4: Cross-project through Omega.T ---
-            # signal_v = Omega.T @ signal_u = VT.T @ (S * (U.T @ signal_u))
-            t = signal_u @ self.U[l, h]  # (d_head,) — equiv. to U.T @ signal_u
-            t = self.S[l, h] * t  # (d_head,)
-            signal_v = t @ self.VT[l, h]  # (d_model,) — equiv. to VT.T.T @ t? No: t @ VT = (VT.T @ t) for 1D... see note
-
-            # NOTE: t @ VT[l,h] where t is (d_head,) and VT is (d_head, d_model)
-            # gives result[k] = sum_j t[j] * VT[j,k], which is the same as
-            # (VT.T @ t)[k] = sum_j VT.T[k,j] * t[j] = sum_j VT[j,k] * t[j].
-            # But we need VT.T @ t (since Omega.T = VT.T @ diag(S) @ U.T).
-            # Since t @ VT == VT.T @ t for 1D vectors, this is correct.
-
+            return signal_u
         else:
             # Project onto V subspace (source/key side)
             # P_V @ transformed = VT[svs,:].T @ (VT[svs,:] @ transformed)
             VT_svs = self.VT[l, h, svs_used, :]  # (n_svs, d_model)
             signal_v = VT_svs.T @ (VT_svs @ transformed)  # (d_model,)
+            return signal_v
 
-            # --- Step 4: Cross-project through Omega ---
-            # signal_u = Omega @ signal_v = U @ (S * (VT @ signal_v))
-            t = self.VT[l, h] @ signal_v  # (d_head,)
-            t = self.S[l, h] * t  # (d_head,)
-            signal_u = self.U[l, h] @ t  # (d_model,)
+    def extract_edge_signal_pair_autointerp(
+        self,
+        cache: ActivationCache,
+        prompt_idx: int,
+        downstream_layer: int,
+        downstream_ah_idx: int,
+        downstream_dest_token: int,
+        downstream_src_token: int,
+        upstream_layer: int,
+        upstream_component_id: int,
+        upstream_dest_token: int,
+        upstream_src_token: int,
+        edge_type: str,
+        svs_used: list[int],
+        *,
+        flavor: Literal["rotated_normalized", "normalized", "raw"] = "rotated_normalized",
+    ) -> tuple[Tensor, Tensor]:
+        """Extract the (signal_u, signal_v) pair for a single circuit edge.
+
+        Autointerp use case: the SVD of QK yields paired query-side (U) and
+        key-side (V) directions, and the *pair* characterizes the
+        communication channel that an upstream component writes into. Per the
+        paper (Sec. 2): "each pair defines a candidate low-dimensional
+        communication channel through which upstream components can influence
+        that head's attention to a destination–source token pair."
+
+        For non-autointerp use cases (intervention, MLP tracing), call
+        :meth:`extract_edge_signal` instead — only the primary signal
+        (matching ``edge_type``) is meaningful there, and the cross-projected
+        complement is not.
+
+        Implementation: computes the primary signal via
+        :meth:`extract_edge_signal` and cross-projects through Omega to get
+        the complementary signal:
+
+        - For dest edges: ``signal_u`` is primary, ``signal_v = Omega.T @ signal_u``
+        - For src edges: ``signal_v`` is primary, ``signal_u = Omega @ signal_v``
+
+        Both directions use the SVD factors ``U, S, VT`` directly (no full
+        Omega matrix is formed).
+
+        Args:
+            (same as ``extract_edge_signal``)
+            flavor: Defaults to ``"rotated_normalized"`` — the only flavor that
+                is conceptually meaningful for autointerp pair analysis. The
+                argument is exposed for debugging / unusual investigations only.
+
+        Returns:
+            (signal_u, signal_v) tuple where:
+                signal_u: Signal in the U (query/dest) space, shape (d_model,).
+                signal_v: Signal in the V (key/source) space, shape (d_model,).
+        """
+        # Compute the primary side via extract_edge_signal
+        primary = self.extract_edge_signal(
+            cache, prompt_idx,
+            downstream_layer, downstream_ah_idx,
+            downstream_dest_token, downstream_src_token,
+            upstream_layer, upstream_component_id,
+            upstream_dest_token, upstream_src_token,
+            edge_type, svs_used,
+            flavor=flavor,
+        )
+
+        l = downstream_layer
+        h = downstream_ah_idx
+
+        if edge_type == "d":
+            signal_u = primary
+            # Cross-project: signal_v = Omega.T @ signal_u = VT.T @ (S * (U.T @ signal_u))
+            t = signal_u @ self.U[l, h]    # (d_head,) — equiv. to U.T @ signal_u
+            t = self.S[l, h] * t           # (d_head,)
+            signal_v = t @ self.VT[l, h]   # (d_model,) — t @ VT == VT.T @ t for 1D
+        else:
+            signal_v = primary
+            # Cross-project: signal_u = Omega @ signal_v = U @ (S * (VT @ signal_v))
+            t = self.VT[l, h] @ signal_v   # (d_head,)
+            t = self.S[l, h] * t           # (d_head,)
+            signal_u = self.U[l, h] @ t    # (d_model,)
 
         return signal_u, signal_v
+
+    # ------------------------------------------------------------------
+    # Causal intervention API
+    # ------------------------------------------------------------------
+
+    def run_intervention(
+        self,
+        tokens: Tensor,
+        cache: ActivationCache,
+        logits: Tensor,
+        edge: EdgeSpec,
+        prompt_idx: int = 0,
+        intervention_type: Literal["local", "global"] = "local",
+        boost: bool = False,
+        center: bool | None = None,
+    ) -> InterventionResult:
+        """Run a single-edge causal intervention.
+
+        Mirrors the structure of the ground-truth ``run_intervention`` function
+        in ``new-code/experiments/interventions.py``, with all upstream-output
+        and signal math inlined as explicit Step 1–7 blocks. The seven steps
+        match the comments in the ground truth.
+
+        For a destination edge (``edge_type="d"``) the intervention is placed
+        at ``downstream_dest_token``. For a source edge (``edge_type="s"``) it
+        is placed at ``downstream_src_token``. **local** mode modifies the
+        Q (for ``"d"``) or K (for ``"s"``) of the downstream head only;
+        **global** mode modifies the upstream component's output in the
+        residual stream. AH offset + global is unsupported and raises.
+
+        Centering policy: LN-pre / LN models center the signal (residuals are
+        zero-mean), RMS-pre / RMS models do not. Auto-detected from
+        ``model.cfg.normalization_type`` unless ``center`` is set explicitly.
+
+        Args:
+            tokens: Input tokens, shape ``(batch, seq)``. Must match the batch
+                dimension of ``cache``.
+            cache: Clean ``ActivationCache`` from a prior
+                ``model.run_with_cache(tokens)`` call.
+            logits: Clean logits from the same forward pass, shape
+                ``(batch, seq, d_vocab)``. Passed through to the result.
+            edge: ``EdgeSpec`` for the single edge to intervene on.
+            prompt_idx: Index of the prompt within the batch to intervene on.
+                Only this prompt's slice of the delta tensor is non-zero.
+            intervention_type: ``"local"`` (modify Q/K input to downstream
+                head) or ``"global"`` (modify upstream component output).
+            boost: If ``True``, *add* the signal (boost the edge). If ``False``
+                (default), *subtract* it (ablate the edge).
+            center: Whether to mean-subtract the signal. ``None`` auto-detects
+                from ``model.cfg.normalization_type``.
+
+        Returns:
+            ``InterventionResult`` carrying logits (clean and interv), the
+            intervention cache, the applied delta tensor, and per-prompt
+            metrics ``norm_ratio``, ``cos_sim``, ``attn_scores_clean``,
+            ``attn_scores_interv``.
+        """
+        model = self.model
+        config = self.config
+        device = self.device
+        n_heads = model.cfg.n_heads
+        d_model = model.cfg.d_model
+
+        # Step 0: validation
+        if intervention_type not in ("local", "global"):
+            raise ValueError(
+                f"intervention_type must be 'local' or 'global', "
+                f"got {intervention_type!r}"
+            )
+        if (intervention_type == "global"
+                and edge.upstream_component_id == n_heads + 3):
+            raise ValueError(
+                "AH offset (component_id == n_heads + 3) cannot be "
+                "intervened on in 'global' mode — no natural hook point "
+                "exists for a bias-projection term. Use 'local' instead."
+            )
+        if center is None:
+            center = _should_center(model.cfg.normalization_type)
+
+        # Resolve downstream layer / head / tokens
+        layer_downstream = edge.downstream_layer
+        ah_idx_downstream = edge.downstream_ah_idx
+        dest_token = edge.downstream_dest_token
+        src_token = edge.downstream_src_token
+
+        layer_upstream = edge.upstream_layer
+        ah_idx_upstream = edge.upstream_component_id
+        dest_token_upstream_idx = edge.upstream_dest_token
+        src_token_upstream_idx = edge.upstream_src_token
+
+        # Intervention position: downstream_dest for "d", downstream_src for "s"
+        pos_interv = dest_token if edge.edge_type == "d" else src_token
+
+        # Step 1: getting the SVs (carried by the EdgeSpec)
+        svs_used = list(edge.svs_used)
+        if len(svs_used) == 0:
+            raise ValueError(
+                "EdgeSpec has empty svs_used; intervention would be a no-op."
+            )
+
+        # Step 2: computing the projection P
+        if edge.edge_type == "d":
+            basis = self.U[layer_downstream, ah_idx_downstream]   # (d_model, rank)
+            B_s = basis[:, svs_used]
+            P = B_s @ B_s.T   # (d_model, d_model)
+        else:
+            basis = self.VT[layer_downstream, ah_idx_downstream].T   # (d_model, rank)
+            B_s = basis[:, svs_used]
+            P = B_s @ B_s.T
+
+        # Step 3: computing upstream_out (case dispatch per component type)
+        if ah_idx_upstream < n_heads:
+            # AH: upstream_out = A * V @ W_O at the (dest_upstream, src_upstream) cell.
+            # Mathematically equivalent to einsum('ti,ij->tij', A, V) @ W_O
+            # indexed at [dest_upstream, src_upstream], but cheaper.
+            A_val = cache[
+                f"blocks.{layer_upstream}.attn.hook_pattern"
+            ][prompt_idx, ah_idx_upstream,
+              dest_token_upstream_idx, src_token_upstream_idx]
+            if config.has_gqa:
+                kv_idx = ah_idx_upstream // config.gqa_repeats
+            else:
+                kv_idx = ah_idx_upstream
+            V_vec = cache[
+                f"blocks.{layer_upstream}.attn.hook_v"
+            ][prompt_idx, src_token_upstream_idx, kv_idx, :]   # (d_head,)
+            upstream_out = A_val * (
+                V_vec @ model.W_O[layer_upstream, ah_idx_upstream, :, :]
+            )   # (d_model,)
+
+            if config.has_post_attn_ln:
+                # Gemma-2: post-attention LN is not folded into the weights.
+                upstream_out = upstream_out * (
+                    model.blocks[layer_upstream].ln1_post.w.detach()
+                )
+                ln_post_term = cache[
+                    f"blocks.{layer_upstream}.ln1_post.hook_scale"
+                ][prompt_idx, dest_token_upstream_idx]
+                upstream_out = upstream_out / ln_post_term
+
+        elif ah_idx_upstream == n_heads:   # MLP
+            upstream_out = cache[
+                f"blocks.{layer_upstream}.hook_mlp_out"
+            ][prompt_idx, dest_token_upstream_idx].clone().detach()
+
+        elif ah_idx_upstream == n_heads + 1:   # AH bias (b_O)
+            upstream_out = model.b_O[layer_upstream].clone().detach()
+
+        elif ah_idx_upstream == n_heads + 2:   # Embedding (residual at layer 0)
+            upstream_out = cache[
+                "blocks.0.hook_resid_pre"
+            ][prompt_idx, dest_token_upstream_idx].clone().detach()
+
+        elif ah_idx_upstream == n_heads + 3:   # AH offset (bias projection)
+            # The signal is a projection of the downstream head's bias offset
+            # through the QK rotation (RoPE) at the intervention position.
+            if config.has_rope:
+                # R applied at the downstream (dest_token for "d", src_token
+                # for "s") — these are exactly pos_interv for each edge type.
+                R = get_rotation_matrix(model, pos_interv, device)
+                if edge.edge_type == "d":
+                    # M_d = W_Q @ R.T @ W_Q_pinv; upstream_out = c_d @ M_d
+                    M_d = (
+                        model.W_Q[layer_downstream, ah_idx_downstream]
+                        @ R.T
+                        @ self.W_Q_pinv[layer_downstream, ah_idx_downstream]
+                    )
+                    upstream_out = (
+                        self.c_d[layer_downstream, ah_idx_downstream] @ M_d
+                    )
+                else:
+                    # M_s = W_K_pinv.T @ R @ W_K.T; upstream_out = M_s @ c_s
+                    M_s = (
+                        self.W_K_pinv[layer_downstream, ah_idx_downstream].T
+                        @ R
+                        @ model.W_K[layer_downstream, ah_idx_downstream].T
+                    )
+                    upstream_out = (
+                        M_s @ self.c_s[layer_downstream, ah_idx_downstream]
+                    )
+            else:
+                # No RoPE: rotation is the identity.
+                if edge.edge_type == "d":
+                    upstream_out = self.c_d[
+                        layer_downstream, ah_idx_downstream
+                    ].clone()
+                else:
+                    upstream_out = self.c_s[
+                        layer_downstream, ah_idx_downstream
+                    ].clone()
+
+        else:
+            raise ValueError(
+                f"Unknown upstream_component_id={ah_idx_upstream} "
+                f"(max valid = {n_heads + 3})"
+            )
+
+        # Step 3.1: computing the intervention value
+        signal = upstream_out @ P   # (d_model,)
+
+        # Step 3.2: centering the intervention value (LN-pre / LN only)
+        if center:
+            signal = signal - signal.mean()
+
+        # Step 3.3: scaling by the downstream LN scale (local only)
+        # The signal is added in LN-normalized space; for local interventions
+        # we divide by the downstream head's ln1 scale at pos_interv to make
+        # the addition consistent with what would have been observed had the
+        # upstream output been different upstream of the LN.
+        if intervention_type == "local":
+            scaling_pos_interv = cache[
+                f"blocks.{layer_downstream}.ln1.hook_scale"
+            ][prompt_idx, pos_interv]
+            signal = signal / scaling_pos_interv
+
+        # Step 3.4: place the intervention value in the delta tensor at pos_interv
+        if intervention_type == "local":
+            ref_hook = f"blocks.{layer_downstream}.ln1.hook_normalized"
+        else:
+            ref_hook = _global_hook_name(
+                layer_upstream, ah_idx_upstream, n_heads
+            )
+        delta_interv_tensor = torch.zeros(
+            cache[ref_hook].shape, device=device
+        )
+        delta_interv_tensor[prompt_idx, pos_interv, :] = signal
+
+        # Step 4: intervening in the model
+        # For local interventions, `_run_local_intervention` returns the
+        # explicitly modified `attn_input_interv` because the Q/K hook does
+        # NOT change `ln1.hook_normalized` in the interv cache — the hook is
+        # applied AFTER ln1, on hook_q/hook_k. We use this returned tensor for
+        # the Step-6 metrics. (The ground truth `run_intervention` does the
+        # same thing — see its `after_interv` variable from
+        # `run_local_intervention`.)
+        if intervention_type == "local":
+            interv_logits, interv_cache, attn_input_interv = (
+                self._run_local_intervention(
+                    tokens, cache,
+                    layer_downstream, ah_idx_downstream,
+                    delta_interv_tensor, boost, edge.edge_type,
+                )
+            )
+        else:
+            interv_logits, interv_cache = self._run_global_intervention(
+                tokens, layer_upstream, ah_idx_upstream,
+                delta_interv_tensor, boost,
+            )
+
+        # Step 6: computing how much we are changing in the intervention
+        # `before_interv` / `after_interv` mirror the ground truth: for local
+        # the downstream LN-normalized input changes; for global the upstream
+        # component output changes.
+        if intervention_type == "local":
+            before_interv = cache[
+                f"blocks.{layer_downstream}.ln1.hook_normalized"
+            ]
+            after_interv = attn_input_interv   # CHANGED: not the cache (see Step 4 note)
+        else:
+            if ah_idx_upstream < n_heads or ah_idx_upstream == n_heads + 1:
+                # AH and AH bias both ride with hook_attn_out
+                before_interv = cache[
+                    f"blocks.{layer_upstream}.hook_attn_out"
+                ]
+                after_interv = interv_cache[
+                    f"blocks.{layer_upstream}.hook_attn_out"
+                ]
+            elif ah_idx_upstream == n_heads:   # MLP
+                before_interv = cache[f"blocks.{layer_upstream}.hook_mlp_out"]
+                after_interv = interv_cache[f"blocks.{layer_upstream}.hook_mlp_out"]
+            else:   # Embedding
+                before_interv = cache["blocks.0.hook_resid_pre"]
+                after_interv = interv_cache["blocks.0.hook_resid_pre"]
+
+        # Restrict to the intervened position (per-prompt). For prompts other
+        # than `prompt_idx` the position is the same but the delta is zero, so
+        # the metrics fall back to their identity values (norm_ratio=1,
+        # cos_sim=1) — clean signal.
+        n_prompts = tokens.shape[0]
+        interv_pos_arange = torch.full(
+            (n_prompts,), pos_interv, device=device, dtype=torch.long
+        )
+        after_at_pos = after_interv[
+            torch.arange(n_prompts, device=device), interv_pos_arange, :
+        ]
+        before_at_pos = before_interv[
+            torch.arange(n_prompts, device=device), interv_pos_arange, :
+        ]
+        norm_ratio = (
+            torch.norm(after_at_pos, dim=1)
+            / torch.norm(before_at_pos, dim=1)
+        )
+        cos_sim = F.cosine_similarity(after_at_pos, before_at_pos, dim=1)
+
+        # Step 7: attention scores at the downstream head's (dest, src) cell
+        attn_scores_clean = cache[
+            f"blocks.{layer_downstream}.attn.hook_pattern"
+        ][:, ah_idx_downstream, dest_token, src_token]
+        attn_scores_interv = interv_cache[
+            f"blocks.{layer_downstream}.attn.hook_pattern"
+        ][:, ah_idx_downstream, dest_token, src_token]
+
+        return InterventionResult(
+            logits_clean=logits,
+            logits_interv=interv_logits,
+            interv_cache=interv_cache,
+            delta=delta_interv_tensor,
+            norm_ratio=norm_ratio,
+            cos_sim=cos_sim,
+            attn_scores_clean=attn_scores_clean,
+            attn_scores_interv=attn_scores_interv,
+        )
+
+    def _run_local_intervention(
+        self,
+        tokens: Tensor,
+        cache: ActivationCache,
+        layer_downstream: int,
+        ah_idx_downstream: int,
+        delta: Tensor,
+        boost: bool,
+        edge_type: Literal["d", "s"],
+    ) -> tuple[Tensor, ActivationCache, Tensor]:
+        """Install Q or K hook for a local intervention and run the model.
+
+        Mirrors ``run_local_intervention`` from the ground-truth experiment.
+        The LN-normalized attention input is shifted by ``+delta`` (boost) or
+        ``-delta`` (ablate), then Q (for ``"d"``) or K (for ``"s"``) is
+        recomputed for the targeted head only and patched into the forward
+        pass via a hook.
+        """
+        model = self.model
+        gqa_repeats = self.config.gqa_repeats if self.config.has_gqa else 1
+
+        # Getting the attention input (same for all heads in the layer)
+        attn_input = cache[
+            f"blocks.{layer_downstream}.ln1.hook_normalized"
+        ]
+        if boost:
+            attn_input_interv = attn_input + delta
+        else:
+            attn_input_interv = attn_input - delta
+
+        # Recompute Q (for "d") or K (for "s") for the targeted head
+        if edge_type == "d":
+            q_interv = F.linear(
+                attn_input_interv,
+                model.W_Q[layer_downstream, ah_idx_downstream, :, :].T,
+                model.b_Q[layer_downstream, ah_idx_downstream, :],
+            )
+            hook = (
+                f"blocks.{layer_downstream}.attn.hook_q",
+                partial(_local_q_hook, ah_idx=ah_idx_downstream, q_interv=q_interv),
+            )
+        else:
+            k_interv = F.linear(
+                attn_input_interv,
+                model.W_K[layer_downstream, ah_idx_downstream, :, :].T,
+                model.b_K[layer_downstream, ah_idx_downstream, :],
+            )
+            kv_idx = ah_idx_downstream // gqa_repeats
+            hook = (
+                f"blocks.{layer_downstream}.attn.hook_k",
+                partial(_local_k_hook, kv_idx=kv_idx, k_interv=k_interv),
+            )
+
+        # Run the model with the hook + caching
+        with model.hooks(fwd_hooks=[hook]):
+            interv_logits, interv_cache = model.run_with_cache(tokens)
+
+        return interv_logits, interv_cache, attn_input_interv
+
+    def _run_global_intervention(
+        self,
+        tokens: Tensor,
+        layer_upstream: int,
+        ah_idx_upstream: int,
+        delta: Tensor,
+        boost: bool,
+    ) -> tuple[Tensor, ActivationCache]:
+        """Install a residual-stream hook for a global intervention and run.
+
+        Mirrors ``run_global_intervention`` from the ground-truth experiment.
+        The upstream component's output is shifted by ``+delta`` (boost) or
+        ``-delta`` (ablate) via a hook on ``hook_attn_out`` (AH or AH bias),
+        ``hook_mlp_out`` (MLP), or ``blocks.0.hook_resid_pre`` (embedding).
+        """
+        model = self.model
+        n_heads = model.cfg.n_heads
+
+        sign = +1.0 if boost else -1.0
+
+        if ah_idx_upstream < n_heads or ah_idx_upstream == n_heads + 1:
+            hook_name = f"blocks.{layer_upstream}.hook_attn_out"
+        elif ah_idx_upstream == n_heads:
+            hook_name = f"blocks.{layer_upstream}.hook_mlp_out"
+        elif ah_idx_upstream == n_heads + 2:
+            hook_name = "blocks.0.hook_resid_pre"
+        else:
+            raise ValueError(
+                f"Invalid ah_idx_upstream={ah_idx_upstream} for global "
+                "intervention"
+            )
+
+        hook = (
+            hook_name,
+            partial(_global_residual_hook, sign=sign, delta=delta),
+        )
+
+        with model.hooks(fwd_hooks=[hook]):
+            interv_logits, interv_cache = model.run_with_cache(tokens)
+
+        return interv_logits, interv_cache
+
+
+def _global_hook_name(
+    layer: int, component_id: int, n_heads: int
+) -> str:
+    """Return the TL hook name for a global intervention's upstream component.
+
+    Raises ``ValueError`` for AH offset (which has no global hook point).
+    """
+    if component_id < n_heads:
+        return f"blocks.{layer}.hook_attn_out"      # AH → summed attn output
+    elif component_id == n_heads:
+        return f"blocks.{layer}.hook_mlp_out"       # MLP
+    elif component_id == n_heads + 1:
+        return f"blocks.{layer}.hook_attn_out"      # AH bias rides with attn_out
+    elif component_id == n_heads + 2:
+        return "blocks.0.hook_resid_pre"            # Embedding
+    elif component_id == n_heads + 3:
+        raise ValueError(
+            "AH offset has no global hook point — call this only after "
+            "validating that the component is not AH offset."
+        )
+    else:
+        raise ValueError(
+            f"Unknown component_id={component_id} (max valid = "
+            f"{n_heads + 3})"
+        )
+
+
+def _local_q_hook(x, hook, ah_idx, q_interv):
+    """TL hook fn — replace one head's Q with the intervention value."""
+    # x: (batch, seq, n_heads, d_head); q_interv: (batch, seq, d_head)
+    x[:, :, ah_idx, :] = q_interv
+    return x
+
+
+def _local_k_hook(x, hook, kv_idx, k_interv):
+    """TL hook fn — replace one KV head's K with the intervention value."""
+    # x: (batch, seq, n_kv_heads, d_head); k_interv: (batch, seq, d_head)
+    x[:, :, kv_idx, :] = k_interv
+    return x
+
+
+def _global_residual_hook(x, hook, sign, delta):
+    """TL hook fn — add/subtract a residual-stream-space delta to the output."""
+    # x and delta have the same shape (batch, seq, d_model)
+    return x + sign * delta
