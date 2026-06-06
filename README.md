@@ -7,7 +7,7 @@ ACC++ decomposes attention head firings into upstream contributions using SVD of
 bilinear form $\Omega = W_Q W_K^T$, producing per-prompt circuit graphs that reveal how
 information flows through the model.
 
-From the paper: ["Finding Highly Interpretable Prompt-Specific Circuits in Language Models"](https://arxiv.org/abs/2602.13483).
+From the paper: ["Finding Interpretable Prompt-Specific Circuits in Language Models"](https://arxiv.org/abs/2602.13483).
 
 ## Installation
 
@@ -133,6 +133,50 @@ graph = tracer.trace_from_cache(
 )
 ```
 
+### Causal interventions
+
+Once a circuit is traced, `Tracer.run_intervention()` ablates (or boosts) one edge of
+the circuit and returns the perturbed logits, cache, and per-prompt metrics. Two modes:
+
+- `"local"` — modify the LN-normalized Q/K input of the downstream head only.
+  Surgical: affects just the targeted edge's downstream head.
+- `"global"` — modify the upstream component's output directly in the residual
+  stream. Broad: affects every downstream consumer. The AH **offset** component
+  has no residual-stream hook point and is not supported here.
+
+Centering is auto-detected from `model.cfg.normalization_type` (LN → center,
+RMS → don't); pass `center=True/False` to override.
+
+```python
+from accpp_tracer import edges_from_graph, InterventionResult
+
+# Re-use model, tracer, dataset, prompt_id, idx_to_token, graph, logits, cache
+# from the `trace_from_cache` example above.
+token_to_idx = {label: idx for idx, label in idx_to_token.items()}
+edges = edges_from_graph(graph, token_to_idx, n_heads=model.cfg.n_heads)
+
+result: InterventionResult = tracer.run_intervention(
+    tokens=dataset.toks,            # (batch, seq)
+    cache=cache,                    # clean ActivationCache
+    logits=logits,                  # (batch, seq, d_vocab)
+    edge=edges[0],                  # one EdgeSpec
+    prompt_idx=prompt_id,
+    intervention_type="local",      # or "global"
+    boost=False,                    # False = ablate, True = boost
+)
+
+# result.logits_interv        (batch, seq, d_vocab)
+# result.interv_cache         intervention ActivationCache
+# result.delta                (batch, seq, d_model) — applied delta
+# result.norm_ratio           (batch,) at intervention position
+# result.cos_sim              (batch,) at intervention position
+# result.attn_scores_clean    (batch,) at downstream (dest, src)
+# result.attn_scores_interv   (batch,) at downstream (dest, src)
+```
+
+The API is intentionally one-edge-per-call: multi-edge experiments loop over `edges`
+and compose at the call site.
+
 ## Supported Models
 
 | Model | Positional encoding | Notes |
@@ -153,14 +197,27 @@ The library exposes three levels of abstraction:
 
 ## Paper reproduction
 
-All experiment scripts are in the companion paper repository. See that repository's
-README for full instructions on reproducing the paper results.
+The companion repository contains all experiment scripts and shell pipelines that
+reproduce the paper's figures and tables:
+
+**https://github.com/gaabrielfranco/finding-highly-interpretable-circuits**
+
+It has a pinned copy of `accpp_tracer` under `lib/accpp_tracer/` and pins
+TransformerLens to the version used for the paper. A single `pip install -e .` from
+the repo root installs everything. The pipelines cover:
+
+- **Tracing & figures** — paper §2, appendices B–D
+- **Causal interventions** — appendix E
+- **Clustering & signals** — §3, appendix F
+- **Autointerpretation** — quantitative and qualitative tracks
+
+See the companion repo's README for run instructions.
 
 ## Citation
 
 ```bibtex
 @article{franco2026finding,
-  title={Finding Highly Interpretable Prompt-Specific Circuits in Language Models},
+  title={Finding Interpretable Prompt-Specific Circuits in Language Models},
   author={Franco, Gabriel and Tassis, Lucas M and Rohr, Azalea and Crovella, Mark},
   journal={arXiv preprint arXiv:2602.13483},
   year={2026}
