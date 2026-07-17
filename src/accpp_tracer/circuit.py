@@ -992,6 +992,75 @@ class Tracer:
         )
 
     @torch.no_grad()
+    def trace_from_probe(
+        self,
+        cache: ActivationCache,
+        probe_direction: Tensor,
+        layer: int,
+        end_token_pos: int,
+        idx_to_token: dict[int, str],
+        root_node: tuple,
+        prompt_idx: int = 0,
+        attn_weight_thresh: str | float | Callable[[int], float] = "dynamic",
+        signals: Literal[None, "rotated_normalized", "normalized", "raw"] = None,
+    ) -> nx.MultiDiGraph:
+        """Trace the circuit that writes a linear probe direction read at an
+        intermediate layer (no logit / vocabulary objective).
+
+        Mirrors :meth:`trace_from_cache`, but the seed step decomposes the
+        residual stream at ``blocks.{layer}.hook_resid_post`` (the ``end_token_pos``
+        position) into per-component shares from layers ``0..layer`` only,
+        projects them onto ``probe_direction``, and selects seeds. From there the
+        upstream recursion is identical to the logit case (``_trace_recursive``).
+
+        ``probe_direction`` must already be oriented toward the side to trace
+        (e.g. +w toward "true", -w toward "false"); orientation and any
+        mean-centering are the caller's responsibility.
+        """
+        model = self.model
+
+        # --- Step 1: per-component contributions to the probe direction ---
+        # We just call the _compute_residual_shares and slice the result to 
+        # layers 0..layer. Also, we undo the ln_final divide (logit
+        # space) so contributions are measured in the probe's raw residual
+        # space; it is a per-position scalar and never affects seed selection.
+
+        # Decompose the residual stream at the end_token_pos into per-component shares
+        r_c = _compute_residual_shares(
+            model, self.config, cache, prompt_idx, end_token_pos, self.device
+        )
+        r_c = r_c[: layer + 1] # slice to layers 0..layer
+        # undo ln_final divide
+        r_c = r_c * cache["ln_final.hook_scale"][prompt_idx, end_token_pos]
+        contrib = r_c @ probe_direction          # (layer+1, n_heads+3, n_tokens)
+
+        # --- Step 2: select seeds (mirrors get_seeds' linear selection) ---
+        if contrib.sum() > 0:
+            trace_seeds = get_upstream_contributors_seed(
+                contrib.detach().cpu().numpy(), 1.0
+            )
+            seeds_contrib = {seed: contrib[seed].item() for seed in trace_seeds}
+        else:
+            # No contribution toward the probe direction (analogue of
+            # get_seeds' "coming from b_U" guard); nothing to trace.
+            trace_seeds, seeds_contrib = [], {}
+
+        # --- Step 3: build the graph (root edges + recurse into AH seeds) ---
+        # Mirrors _trace_from_cache_inner: only build if at least one AH seed 
+        # exists (leaf-only seeds carry no circuit to recurse).
+        G = nx.MultiDiGraph()
+        is_traced: dict[tuple, int] = {}
+        if len(trace_seeds) > 0 and any(
+            ah_idx < model.cfg.n_heads for _, ah_idx, _ in trace_seeds
+        ):
+            self._add_seeds_to_graph(
+                G, is_traced, trace_seeds, seeds_contrib, root_node,
+                cache, idx_to_token, prompt_idx, end_token_pos,
+                attn_weight_thresh, signals,
+            )
+        return G
+
+    @torch.no_grad()
     def _trace_from_cache_inner(
         self,
         model,
