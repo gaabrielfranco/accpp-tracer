@@ -26,3 +26,9 @@ htmlcov/
 
 # OS
 .DS_Store
+
+# Local trace outputs and generated visualizations
+results/
+
+# Claude Code session tooling
+.claude/
