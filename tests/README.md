@@ -1,9 +1,11 @@
 # accpp_tracer test suite
 
-Quick regression suite exercising every main API of the library on two small
-models from the local HF cache: **gpt2** (LayerNorm, absolute positions) and
-**EleutherAI/pythia-160m** (RoPE). Everything runs on CPU in fp32 for
-determinism. Full run: ~4 minutes.
+Quick regression suite exercising every main API of the library on three
+small models from the local HF cache: **gpt2** (LayerNorm, absolute
+positions), **EleutherAI/pythia-160m** (RoPE), and **Qwen/Qwen2.5-0.5B**
+(RoPE + 7× GQA + large QK biases — the only fixture where the AH bias /
+AH offset components are strongly active). Everything runs on CPU in fp32
+for determinism. Full run: ~4 minutes.
 
 ```bash
 pytest                    # run the suite (compares against tests/golden/)

@@ -206,3 +206,13 @@ def test_golden_graph_pythia_topk(pythia_topk_graph, update_golden):
     assert_graph_matches(
         pythia_topk_graph, GOLDEN_DIR / "graph_pythia_topk.json", update_golden
     )
+
+
+def test_trace_qwen_prob(qwen_prob_graph):
+    _check_graph_structure(qwen_prob_graph)
+
+
+def test_golden_graph_qwen_prob(qwen_prob_graph, update_golden):
+    assert_graph_matches(
+        qwen_prob_graph, GOLDEN_DIR / "graph_qwen_prob.json", update_golden
+    )
