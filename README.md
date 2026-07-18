@@ -246,6 +246,19 @@ and compose at the call site.
 | `gpt2-small` | Standard | Attention bias |
 | `EleutherAI/pythia-160m` | RoPE | Attention bias, parallel attn+MLP |
 | `gemma-2-2b` | RoPE | GQA, attention softcapping, no bias |
+| `meta-llama/Llama-3.1-8B` | RoPE (NTK-by-parts) | GQA, no QK bias; fp32 weights ~30 GB — needs a large-memory GPU or high-RAM CPU |
+
+### Prompt length limit
+
+`trace_firing` keeps a per-singular-vector attention-score breakdown of shape
+`(layer, n_heads + 4, d_head, T, T)` for both the query and key sides. This
+T² scaling is inherent to the per-SV granularity of the method (the greedy
+selection needs the full tensor), and bounds the usable prompt length: at
+Llama-3.1-8B scale it is ~1.1 MB x T² at the deepest layer (~1 GB at T=30,
+~19 GB at T=128). On an 80 GB device, prompts up to roughly 100-150 tokens
+are practical; IOI-style prompts are far below this. If longer prompts are
+ever needed, chunk over upstream layers or store per-SV scores sparsely
+after thresholding.
 
 ## API levels
 
@@ -274,6 +287,78 @@ the repo root installs everything. The pipelines cover:
 - **Autointerpretation** — quantitative and qualitative tracks
 
 See the companion repo's README for run instructions.
+
+## Interactive circuit visualization
+
+`accpp_tracer.graphs.circuit_to_html` renders a traced graph as a single
+self-contained HTML file — no external dependencies or network access, so the
+file can be opened locally, attached to a paper, or shared as-is:
+
+```python
+from accpp_tracer.graphs import circuit_to_html
+
+graph = tracer.trace(prompt, answer_token=" Mary")
+
+# Token labels must match the graph's node labels — the same construction
+# Tracer.trace uses internally (duplicate tokens get " (1)", " (2)", ...).
+circuit_to_html(
+    graph,
+    tokens=tokens,                       # position-ordered token labels
+    n_layers=model.cfg.n_layers,
+    out_path="circuit.html",
+    title="Llama-3.2-3B — traced IOI circuit",
+    subtitle="objective: P(' Mary') at the final position",  # HTML allowed
+    stats={"P( Mary)": "0.387", "nodes": "63"},              # header chips
+)
+```
+
+The page lays the circuit out with token positions on the x-axis and layers
+on the y-axis (each head sits at its *destination* token; the root objective
+sits above the final position). Component kinds get distinct shapes and
+colors (attention heads, MLPs, embeddings, attention biases, AH offsets —
+only kinds present appear in the legend); query-side (`d`) and key-side
+(`s`) edges are distinguished by color *and* dash pattern; line width scales
+with edge weight. Hovering any node or edge shows details (attention
+weights, per-edge singular-vector channels); clicking a node pins its
+incident edges; a collapsible table lists every edge sorted by weight. Light
+and dark color schemes are both supported (OS preference, or set
+`data-theme="dark"`/`"light"` on the document root).
+
+## Test suite
+
+`tests/` contains a fast regression suite (~3 minutes, CPU-only) that
+exercises every public API on two small models from the local HF cache —
+**gpt2** (LayerNorm, absolute positions) and **EleutherAI/pythia-160m**
+(RoPE) — plus a tiny random-weight Llama-3-style model (GQA + RMSNorm +
+NTK-by-parts RoPE) that covers the architecture features the real test
+models lack.
+
+```bash
+pip install -e ".[dev,typecheck]"
+pytest                    # run everything, compare against tests/golden/
+pytest --update-golden    # re-baseline golden files (see below)
+```
+
+Two kinds of tests:
+
+1. **Invariant tests** — mathematical properties that hold for any model and
+   survive any refactor: the Omega SVD reconstructs `W_Q @ W_K^T`, component
+   residual shares sum to the LN-normalized stream, RoPE matrices are
+   orthogonal and match TransformerLens's own sin/cos tables, and
+   `trace_firing`'s internal decomposition assertions pass.
+2. **Golden regression tests** — outputs captured in `tests/golden/` from a
+   known-good revision: SVD fingerprints (sign-invariant random-projection
+   sketches), rotation-matrix stacks, `trace_firing` results, and fully
+   serialized traced graphs. Comparisons require exact topology and
+   singular-vector selection, with a small float tolerance (5e-3) on weights
+   to absorb fp32 contraction-reorder noise.
+
+Workflow: for a behavior-preserving change (memory/speed refactor), all
+tests must pass against the existing goldens — do not regenerate them. For
+an intended behavioral change, inspect the golden diffs, confirm they match
+the intent, then re-baseline with `pytest --update-golden` and commit the
+new goldens together with the code. `tests/README.md` has the full details,
+including how to add a new model to the suite.
 
 ## Citation
 

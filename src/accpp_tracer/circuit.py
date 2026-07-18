@@ -34,7 +34,7 @@ from .intervention import (
     _should_center,
 )
 from .models import get_model_config, ModelConfig
-from .rope import get_rotation_matrix
+from .rope import get_rotation_matrices
 from .signals import get_component_output
 from .tracing import trace_firing
 from ._typecheck import typechecked
@@ -132,26 +132,28 @@ def _compute_residual_shares(
     """
     n_tokens = end_token_pos + 1
 
-    # Breaking down the OV for all AHs in the model
+    # Breaking down the OV for all AHs in the model. Only the
+    # ``end_token_pos`` destination row is ever consumed downstream, so the
+    # full (dest-token, src-token) plane is never materialized — the tensor
+    # is (n_layers, n_heads + 3, src_token, d_model) directly.
     upstream_output_breakdown = torch.zeros(
         (
             model.cfg.n_layers,
             model.cfg.n_heads + 3,
-            n_tokens,
             n_tokens,
             model.cfg.d_model,
         ),
         device=device,
     )
     # Embedding
-    upstream_output_breakdown[0, -1, end_token_pos, end_token_pos] = (
+    upstream_output_breakdown[0, -1, end_token_pos] = (
         cache["blocks.0.hook_resid_pre"][prompt_idx, end_token_pos].clone().detach()
     )
     for upstream_layer in range(model.cfg.n_layers):
         for upstream_ah_idx in range(model.cfg.n_heads + 3):
             if upstream_ah_idx < model.cfg.n_heads:  # AHs
-                A = cache[f"blocks.{upstream_layer}.attn.hook_pattern"][
-                    prompt_idx, upstream_ah_idx, :n_tokens, :n_tokens
+                A_row = cache[f"blocks.{upstream_layer}.attn.hook_pattern"][
+                    prompt_idx, upstream_ah_idx, end_token_pos, :n_tokens
                 ]
                 if config.has_gqa:
                     V = cache[f"blocks.{upstream_layer}.attn.hook_v"][
@@ -165,7 +167,7 @@ def _compute_residual_shares(
                         prompt_idx, :n_tokens, upstream_ah_idx, :
                     ]
                 upstream_output_breakdown[upstream_layer, upstream_ah_idx] = (
-                    torch.einsum("ti,ij->tij", A, V)
+                    (A_row.unsqueeze(-1) * V)
                     @ model.W_O[upstream_layer, upstream_ah_idx, :, :]
                 )
 
@@ -175,15 +177,15 @@ def _compute_residual_shares(
                     )
                     ln_post_term = cache[
                         f"blocks.{upstream_layer}.ln1_post.hook_scale"
-                    ][prompt_idx, :n_tokens]
+                    ][prompt_idx, end_token_pos]
                     upstream_output_breakdown[upstream_layer, upstream_ah_idx] /= (
-                        ln_post_term.view(ln_post_term.shape[0], 1, 1)
+                        ln_post_term
                     )
 
             # For all these cases, both dest and src tokens are the same
             elif upstream_ah_idx == model.cfg.n_heads:  # MLP
                 upstream_output_breakdown[
-                    upstream_layer, upstream_ah_idx, end_token_pos, end_token_pos
+                    upstream_layer, upstream_ah_idx, end_token_pos
                 ] = (
                     cache[f"blocks.{upstream_layer}.hook_mlp_out"][
                         prompt_idx, end_token_pos
@@ -191,11 +193,11 @@ def _compute_residual_shares(
                 )
             elif upstream_ah_idx == model.cfg.n_heads + 1:  # AH bias
                 upstream_output_breakdown[
-                    upstream_layer, upstream_ah_idx, end_token_pos, end_token_pos
+                    upstream_layer, upstream_ah_idx, end_token_pos
                 ] = model.b_O[upstream_layer].clone().detach()
 
     return (
-        upstream_output_breakdown[:, :, end_token_pos, :, :]
+        upstream_output_breakdown
         / cache["ln_final.hook_scale"][prompt_idx, end_token_pos]
     )
 
@@ -649,6 +651,25 @@ class Tracer:
             "n_layers n_heads d_head, n_layers n_heads d_head d_model "
             "-> n_layers n_heads d_model",
         )
+
+        # Lazily-built cache of stacked RoPE rotation matrices (None for
+        # non-RoPE models). Depends only on the model config and the largest
+        # position seen so far; grows on demand via _rotation_stack().
+        self._R_stack: Tensor | None = None
+
+    def _rotation_stack(self, n_positions: int) -> Tensor | None:
+        """Cached RoPE rotation matrices covering positions 0..n_positions-1.
+
+        Returns None for models without RoPE. The returned stack may be
+        longer than requested; callers index by absolute position.
+        """
+        if not self.config.has_rope:
+            return None
+        if self._R_stack is None or self._R_stack.shape[0] < n_positions:
+            self._R_stack = get_rotation_matrices(
+                self.model, n_positions, self.device
+            )
+        return self._R_stack
 
     def trace(
         self,
@@ -1266,6 +1287,7 @@ class Tracer:
             self.config,
             self.device,
             attn_weight_thresh_eval,
+            R_stack=self._rotation_stack(dest_token + 1),
         )
 
         ah_idx_label = get_ah_idx_label(ah_idx, self.model.cfg.n_heads)
@@ -1582,9 +1604,9 @@ class Tracer:
             # Rotation position: upstream_dest_token for both edge types.
             # For dest edges: upstream_dest_token == downstream_dest_token.
             # For src edges: upstream_dest_token == downstream_src_token.
-            R = get_rotation_matrix(
-                self.model, upstream_dest_token, self.device
-            )  # shape: (d_head, d_head)
+            R = self._rotation_stack(upstream_dest_token + 1)[
+                upstream_dest_token
+            ]  # shape: (d_head, d_head)
 
             if edge_type == "d":
                 # x @ M_d where M_d = W_Q @ R.T @ W_Q_pinv
@@ -1867,7 +1889,7 @@ class Tracer:
             if config.has_rope:
                 # R applied at the downstream (dest_token for "d", src_token
                 # for "s") — these are exactly pos_interv for each edge type.
-                R = get_rotation_matrix(model, pos_interv, device)
+                R = self._rotation_stack(pos_interv + 1)[pos_interv]
                 if edge.edge_type == "d":
                     # M_d = W_Q @ R.T @ W_Q_pinv; upstream_out = c_d @ M_d
                     M_d = (

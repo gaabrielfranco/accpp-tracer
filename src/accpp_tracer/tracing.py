@@ -15,7 +15,7 @@ from transformer_lens import HookedTransformer, ActivationCache
 
 from .attribution import ig_softmax_attributions
 from .models import ModelConfig
-from .rope import get_rotation_matrix
+from .rope import get_rotation_matrices
 from ._typecheck import typechecked
 
 def _greedy_algorithm(
@@ -55,6 +55,14 @@ def _greedy_algorithm(
     """
     MAX_ITER = 1000
     n_iter = 0
+    # Hard bound: once every component has been zeroed there is nothing left
+    # to select. Without this, a fixed attn_weight_thresh below the uniform
+    # attention level (1 / (dest_token + 1)) would run past the end of
+    # list_order / re-select -inf entries, since zeroing everything leaves a
+    # uniform attention distribution that never drops below the threshold.
+    n_components_total = upstream_attention_scores_breakdown[
+        :, :, :, :, 0
+    ].numel()
 
     curr_attn_weight = (
         cache[f"blocks.{layer}.attn.hook_pattern"][
@@ -74,7 +82,11 @@ def _greedy_algorithm(
     important_components: list[tuple] = []
     edge_weights: dict[tuple, float] = defaultdict(float)
 
-    while curr_attn_weight >= attn_weight_thresh and n_iter <= MAX_ITER:
+    while (
+        curr_attn_weight >= attn_weight_thresh
+        and n_iter <= MAX_ITER
+        and n_iter < n_components_total
+    ):
         if list_order is None:
             # Adaptive ordering: pick the component that most increases src attention
             delta_s_col = upstream_attention_scores_breakdown[
@@ -165,8 +177,9 @@ def _trace_firing_inner(
     device: str,
     c_d: Float[Tensor, "n_layers n_heads d_model"],
     c_s: Float[Tensor, "n_layers n_heads d_model"],
-    M_d: Float[Tensor, "d_model d_model"],
-    M_s_all: Float[Tensor, "n_tokens d_model d_model"],
+    W_Q_pinv: Float[Tensor, "n_layers n_heads d_head d_model"],
+    W_K_pinv: Float[Tensor, "n_layers n_heads d_head d_model"],
+    R_stack: Float[Tensor, "n_tokens d_head d_head"] | None,
     attn_weight_thresh: float,
     config: ModelConfig,
 ) -> tuple[dict, dict, dict, dict]:
@@ -175,6 +188,22 @@ def _trace_firing_inner(
     Decomposes the attention score at (dest_token, src_token) into contributions
     from all upstream components (MLPs, attention heads, embeddings, biases)
     across all preceding layers.
+
+    Omega = U @ diag(S) @ VT is NEVER materialized as a dense
+    (d_head, d_model, d_model) tensor (8 GiB per call at Llama-3.1-8B scale).
+    Instead, both sides of every score contraction are projected into d_head
+    space first:
+
+    - dest side: ``x @ M_d @ (U * S)`` computed as
+      ``((x @ W_Q) @ R_dest.T) @ (W_Q_pinv @ (U * S))``
+    - src side:  ``VT @ M_s @ y`` computed as
+      ``(VT @ W_K_pinv.T) @ R_t @ (y @ W_K)``
+
+    and the per-SV score is their elementwise product. This is exact (pure
+    associativity of the matrix products); only float rounding order differs.
+    The rotation matrices enter only as the (n_tokens, d_head, d_head) stack
+    ``R_stack`` — the (n_tokens, d_model, d_model) ``M_s_all`` tensor is gone
+    too.
 
     Args:
         model: HookedTransformer model.
@@ -190,8 +219,10 @@ def _trace_firing_inner(
         device: Torch device.
         c_d: Query bias offset, shape (n_layers, n_heads, d_model).
         c_s: Key bias offset, shape (n_layers, n_heads, d_model).
-        M_d: Destination rotation/projection matrix.
-        M_s_all: Source rotation/projection matrices per token.
+        W_Q_pinv: Pseudoinverse of W_Q, per layer and head.
+        W_K_pinv: Pseudoinverse of W_K, per layer and head.
+        R_stack: RoPE rotation matrices for positions 0..dest_token, or None
+            for models without RoPE (identity rotation).
         attn_weight_thresh: Minimum attention weight for greedy selection.
         config: Model configuration.
 
@@ -223,20 +254,42 @@ def _trace_firing_inner(
         layer, n_heads + 4, d_head, dest_token + 1, dest_token + 1, device=device
     )
 
-    # Computing Omega as d_head rank-1 matrices
-    Omega = einsum(
-        U[layer, ah_idx] * S[layer, ah_idx],
-        VT[layer, ah_idx],
-        "d_model d_head, d_head d_model_out -> d_head d_model d_model_out",
-    )
+    # Factored projections into d_head space (see docstring). ``proj_dest``
+    # maps dest-side residual vectors to per-SV coefficients (S is absorbed
+    # on this side); ``proj_src`` maps src-side residual vectors — with the
+    # token dim second-to-last, aligned with R_stack — to per-SV coefficients.
+    US = U[layer, ah_idx] * S[layer, ah_idx]  # (d_model, d_head)
+    V_h = VT[layer, ah_idx]                   # (d_head, d_model)
 
-    # Pre-compute fixed terms for dest and source contributions
-    X_s_all_rot = einsum(
-        M_s_all,
-        X + c_s[layer, ah_idx],
-        "n_tokens d_model d_model_out, n_tokens d_model_out -> n_tokens d_model",
-    )
-    X_d_rot = (X[dest_token] + c_d[layer, ah_idx]) @ M_d
+    if R_stack is not None:
+        W_Q_h = model.W_Q[layer, ah_idx]      # (d_model, d_head)
+        W_K_h = model.W_K[layer, ah_idx]      # (d_model, d_head)
+        G_d = W_Q_pinv[layer, ah_idx] @ US    # (d_head, d_head)
+        G_s = V_h @ W_K_pinv[layer, ah_idx].T # (d_head, d_head)
+        R_dest_T = R_stack[dest_token].T
+
+        def proj_dest(x):
+            # x @ M_d @ US with M_d = W_Q @ R_dest.T @ W_Q_pinv
+            return ((x @ W_Q_h) @ R_dest_T) @ G_d
+
+        def proj_src(y):
+            # V_h @ M_s_t @ y with M_s_t = W_K_pinv.T @ R_t @ W_K.T;
+            # y: (..., n_tokens, d_model) -> (..., n_tokens, d_head)
+            t = torch.einsum("tij,...tj->...ti", R_stack, y @ W_K_h)
+            return t @ G_s.T
+    else:
+        def proj_dest(x):
+            return x @ US
+
+        def proj_src(y):
+            return y @ V_h.T
+
+    # Pre-compute fixed terms for dest and source contributions:
+    # B_src[t] = V_h @ M_s_t @ (X_t + c_s)  — the src-side coefficients the
+    # dest updates contract against; a_dest = (X_dest + c_d) @ M_d @ US — the
+    # dest-side coefficients the src updates contract against.
+    B_src = proj_src(X + c_s[layer, ah_idx])              # (n_tokens, d_head)
+    a_dest = proj_dest(X[dest_token] + c_d[layer, ah_idx])  # (d_head,)
 
     for upstream_layer in range(layer):
         # MLP
@@ -299,69 +352,53 @@ def _trace_firing_inner(
         upstream_attention_scores_breakdown_dest[
             upstream_layer, mlp_idx, :, dest_token, range(dest_token + 1)
         ] = einsum(
-            X_mlp[dest_token] @ M_d,
-            Omega,
-            X_s_all_rot,
-            "d_model, d_head d_model d_model_out, n_tokens d_model_out -> d_head n_tokens",
+            proj_dest(X_mlp[dest_token]),
+            B_src,
+            "d_head, n_tokens d_head -> d_head n_tokens",
         )
         upstream_attention_scores_breakdown_src[
             upstream_layer, mlp_idx, :, src_token, range(dest_token + 1)
         ] = einsum(
-            X_d_rot,
-            Omega,
-            einsum(
-                M_s_all,
-                X_mlp,
-                "n_tokens d_model d_model_out, n_tokens d_model_out -> n_tokens d_model",
-            ),
-            "d_model, d_head d_model d_model_out, n_tokens d_model_out -> d_head n_tokens",
+            a_dest,
+            proj_src(X_mlp),
+            "d_head, n_tokens d_head -> d_head n_tokens",
         )
 
         # AH bias update
         upstream_attention_scores_breakdown_dest[
             upstream_layer, bias_idx, :, dest_token, range(dest_token + 1)
         ] = einsum(
-            X_ah_bias[dest_token] @ M_d,
-            Omega,
-            X_s_all_rot,
-            "d_model, d_head d_model d_model_out, n_tokens d_model_out -> d_head n_tokens",
+            proj_dest(X_ah_bias[dest_token]),
+            B_src,
+            "d_head, n_tokens d_head -> d_head n_tokens",
         )
         upstream_attention_scores_breakdown_src[
             upstream_layer, bias_idx, :, src_token, range(dest_token + 1)
         ] = einsum(
-            X_d_rot,
-            Omega,
-            einsum(
-                M_s_all,
-                X_ah_bias,
-                "n_tokens d_model d_model_out, n_tokens d_model_out -> n_tokens d_model",
-            ),
-            "d_model, d_head d_model d_model_out, n_tokens d_model_out -> d_head n_tokens",
+            a_dest,
+            proj_src(X_ah_bias),
+            "d_head, n_tokens d_head -> d_head n_tokens",
         )
 
-        # AH update
+        # AH update. For the src side, ``proj_src`` rotates by the
+        # second-to-last (token) dim, so X_ah (n_heads, n_tokens,
+        # n_tokens_breakdown, d_model) is permuted to put the rotated token
+        # dim next to d_model, then laid out per the breakdown convention.
         upstream_attention_scores_breakdown_dest[
             upstream_layer, range(n_heads), :, :, :
         ] = einsum(
-            X_ah[:, dest_token, :, :] @ M_d,
-            Omega,
-            X_s_all_rot,
-            "n_heads n_tokens_breakdown d_model, d_head d_model d_model_out, "
-            "n_tokens d_model_out -> n_heads d_head n_tokens_breakdown n_tokens",
+            proj_dest(X_ah[:, dest_token, :, :]),
+            B_src,
+            "n_heads n_tokens_breakdown d_head, n_tokens d_head "
+            "-> n_heads d_head n_tokens_breakdown n_tokens",
         )
         upstream_attention_scores_breakdown_src[
             upstream_layer, range(n_heads), :, :, :
         ] = einsum(
-            X_d_rot,
-            Omega,
-            einsum(
-                M_s_all,
-                X_ah,
-                "n_tokens d_model d_model_out, n_heads n_tokens n_tokens_breakdown "
-                "d_model_out -> n_heads n_tokens n_tokens_breakdown d_model",
-            ),
-            "d_model, d_head d_model d_model_out, n_heads n_tokens n_tokens_breakdown "
-            "d_model_out -> n_heads d_head n_tokens_breakdown n_tokens",
+            a_dest,
+            proj_src(X_ah.permute(0, 2, 1, 3)),
+            "d_head, n_heads n_tokens_breakdown n_tokens d_head "
+            "-> n_heads d_head n_tokens_breakdown n_tokens",
         )
 
         # Embedding update
@@ -369,22 +406,16 @@ def _trace_firing_inner(
             upstream_attention_scores_breakdown_dest[
                 upstream_layer, embed_idx, :, dest_token, range(dest_token + 1)
             ] = einsum(
-                X_embed[dest_token] @ M_d,
-                Omega,
-                X_s_all_rot,
-                "d_model, d_head d_model d_model_out, n_tokens d_model_out -> d_head n_tokens",
+                proj_dest(X_embed[dest_token]),
+                B_src,
+                "d_head, n_tokens d_head -> d_head n_tokens",
             )
             upstream_attention_scores_breakdown_src[
                 upstream_layer, embed_idx, :, src_token, range(dest_token + 1)
             ] = einsum(
-                X_d_rot,
-                Omega,
-                einsum(
-                    M_s_all,
-                    X_embed,
-                    "n_tokens d_model d_model_out, n_tokens d_model_out -> n_tokens d_model",
-                ),
-                "d_model, d_head d_model d_model_out, n_tokens d_model_out -> d_head n_tokens",
+                a_dest,
+                proj_src(X_embed),
+                "d_head, n_tokens d_head -> d_head n_tokens",
             )
 
     # Constant (bias offset) term
@@ -392,22 +423,16 @@ def _trace_firing_inner(
     upstream_attention_scores_breakdown_dest[
         0, constant_idx, :, dest_token, range(dest_token + 1)
     ] = einsum(
-        c_d[layer, ah_idx] @ M_d,
-        Omega,
-        X_s_all_rot,
-        "d_model, d_head d_model d_model_out, n_tokens d_model_out -> d_head n_tokens",
+        proj_dest(c_d[layer, ah_idx]),
+        B_src,
+        "d_head, n_tokens d_head -> d_head n_tokens",
     )
     upstream_attention_scores_breakdown_src[
         0, constant_idx, :, src_token, range(dest_token + 1)
     ] = einsum(
-        X_d_rot,
-        Omega,
-        einsum(
-            M_s_all,
-            c_s[layer, ah_idx].repeat(dest_token + 1, 1),
-            "n_tokens d_model d_model_out, n_tokens d_model_out -> n_tokens d_model",
-        ),
-        "d_model, d_head d_model d_model_out, n_tokens d_model_out -> d_head n_tokens",
+        a_dest,
+        proj_src(c_s[layer, ah_idx].repeat(dest_token + 1, 1)),
+        "d_head, n_tokens d_head -> d_head n_tokens",
     )
 
     # Normalize by attention scale (usually sqrt(d_head))
@@ -485,6 +510,7 @@ def trace_firing(
     config: ModelConfig,
     device: str,
     attn_weight_thresh: float,
+    R_stack: Float[Tensor, "n_positions d_head d_head"] | None = None,
 ) -> tuple[dict, dict, dict, dict]:
     """Trace an attention head's firing pattern back through upstream layers.
 
@@ -508,6 +534,9 @@ def trace_firing(
         config: Model configuration (from get_model_config).
         device: Torch device.
         attn_weight_thresh: Minimum attention weight for greedy selection.
+        R_stack: Optional pre-computed RoPE rotation matrices covering at
+            least positions 0..dest_token (e.g. the Tracer's cached stack).
+            Only used for RoPE models; computed on the fly when None.
 
     Returns:
         Tuple of (dest_components, dest_edge_weights, src_components, src_edge_weights)
@@ -528,26 +557,17 @@ def trace_firing(
     )
 
     if config.has_rope:
-        R = torch.stack(
-            [get_rotation_matrix(model, i, device) for i in range(dest_token + 1)]
-        )
-        M_d = model.W_Q[layer, ah_idx] @ R[dest_token].T @ W_Q_pinv[layer, ah_idx]
-        M_s_all = einsum(
-            W_K_pinv[layer, ah_idx].T,
-            R,
-            model.W_K[layer, ah_idx].T,
-            "d_model d_head_a, n_tokens d_head_a d_head_b, d_head_b d_model_out "
-            "-> n_tokens d_model d_model_out",
-        )
+        if R_stack is None:
+            R_stack = get_rotation_matrices(model, dest_token + 1, device)
+        else:
+            assert R_stack.shape[0] >= dest_token + 1
+            R_stack = R_stack[: dest_token + 1]
     else:
-        # Identity rotation for models without RoPE
-        M_s_all = torch.stack(
-            [torch.eye(model.cfg.d_model, device=device) for _ in range(dest_token + 1)]
-        )
-        M_d = M_s_all[0]
+        # Models without RoPE: identity rotation, handled as None downstream.
+        R_stack = None
 
     return _trace_firing_inner(
         model, cache, prompt_id, layer, ah_idx, dest_token, src_token,
-        U, S, VT, device, c_d, c_s, M_d, M_s_all,
+        U, S, VT, device, c_d, c_s, W_Q_pinv, W_K_pinv, R_stack,
         attn_weight_thresh, config,
     )

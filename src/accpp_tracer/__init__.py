@@ -11,7 +11,7 @@ from .decomposition import (
 )
 from .intervention import EdgeSpec, InterventionResult, edges_from_graph
 from .models import ModelConfig, get_model_config
-from .rope import get_rotation_matrix, get_rotary_matrix
+from .rope import get_rotation_matrices, get_rotation_matrix, get_rotary_matrix
 from .signals import component_label_to_id, get_component_output
 from .tracing import trace_firing
 
@@ -35,6 +35,7 @@ __all__ = [
     "load_decomposition_cache",
     "save_decomposition_cache",
     # RoPE
+    "get_rotation_matrices",
     "get_rotation_matrix",
     "get_rotary_matrix",
     # Model config (derived from TransformerLens model.cfg)
