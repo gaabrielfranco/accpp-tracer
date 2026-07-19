@@ -464,15 +464,15 @@ def get_name_idxs(prompts, tokenizer, model_family, idx_types=["IO", "S1", "S2"]
         toks = tokenizer.tokenize(" ".join(text_split[:-1]))
         # Get the first instance of IO token
         name_idx_dict["IO"].append(
-            toks.index(tokenizer.tokenize(" " + prompt["IO"] if model_family  in ["gpt2", "pythia", "gemma", "llama3"] else prompt["IO"])[0])
+            toks.index(tokenizer.tokenize(" " + prompt["IO"] if model_family  in ["gpt2", "pythia", "gemma", "llama3", "qwen"] else prompt["IO"])[0])
         )
         # Get the first instance of S token
         name_idx_dict["S1"].append(
-            toks.index(tokenizer.tokenize(" " + prompt["S"] if model_family  in ["gpt2", "pythia", "gemma", "llama3"] else prompt["S"])[0])
+            toks.index(tokenizer.tokenize(" " + prompt["S"] if model_family  in ["gpt2", "pythia", "gemma", "llama3", "qwen"] else prompt["S"])[0])
         )
         # Get the last instance of S token
         name_idx_dict["S2"].append(
-            len(toks) - toks[::-1].index(tokenizer.tokenize(" " + prompt["S"] if model_family  in ["gpt2", "pythia", "gemma", "llama3"] else prompt["S"])[0]) - 1
+            len(toks) - toks[::-1].index(tokenizer.tokenize(" " + prompt["S"] if model_family  in ["gpt2", "pythia", "gemma", "llama3", "qwen"] else prompt["S"])[0]) - 1
         )
 
     return [
@@ -483,7 +483,7 @@ def get_name_idxs(prompts, tokenizer, model_family, idx_types=["IO", "S1", "S2"]
 
 def get_word_idxs(prompts, word_list, tokenizer, model_family):
     """Get the index of the words in word_list in the prompts. Exactly one of the word_list word has to be present in each prompt"""
-    if model_family in ["gpt2", "pythia", "llama3"]:
+    if model_family in ["gpt2", "pythia", "llama3", "qwen"]:
         add_special_tokens = False
     elif model_family in ["llama2", "gemma"]:
         add_special_tokens = True
@@ -519,7 +519,7 @@ def get_end_idxs(toks, tokenizer, model_family, name_tok_len=1, prepend_bos=Fals
     # if the sentence begins with an end token
     # AND the model pads at the end with the same end token,
     # then we need make special arrangements
-    if model_family in ["gpt2", "pythia", "llama3"]:
+    if model_family in ["gpt2", "pythia", "llama3", "qwen"]:
         relevant_idx = int(prepend_bos)
     elif model_family in ["llama2", "gemma"]:
         relevant_idx = 0
@@ -567,7 +567,7 @@ def get_idx_dict(ioi_prompts, tokenizer, model_family, prepend_bos=False, toks=N
 
     punct_idxs = get_word_idxs(ioi_prompts, [",", "."], tokenizer, model_family)
 
-    if model_family in ["gpt2", "pythia", "gemma", "llama3"]:
+    if model_family in ["gpt2", "pythia", "gemma", "llama3", "qwen"]:
         verbs = get_word_idxs(ioi_prompts, [" gave", " give", " said"], tokenizer, model_family)
     elif model_family in ["llama2"]:
          verbs = get_word_idxs(ioi_prompts, ["gave", "give", "said"], tokenizer, model_family)
@@ -613,7 +613,7 @@ class IOIDataset:
         np.random.seed(self.seed)
 
         self.model_family = model_family
-        if not self.model_family in ["gpt2", "pythia", "llama2", "gemma", "llama3"]:
+        if not self.model_family in ["gpt2", "pythia", "llama2", "gemma", "llama3", "qwen"]:
             raise Exception(f"model_family: {model_family} is not implemented.")
 
         if not (

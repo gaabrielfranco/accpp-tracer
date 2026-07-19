@@ -247,6 +247,7 @@ and compose at the call site.
 | `EleutherAI/pythia-160m` | RoPE | Attention bias, parallel attn+MLP |
 | `gemma-2-2b` | RoPE | GQA, attention softcapping, no bias |
 | `meta-llama/Llama-3.1-8B` | RoPE (NTK-by-parts) | GQA, no QK bias; fp32 weights ~30 GB — needs a large-memory GPU or high-RAM CPU |
+| `Qwen/Qwen2.5-0.5B` … `7B` | RoPE | GQA (up to 7× KV sharing), large QK biases (AH bias / AH offset components are strongly active) |
 
 ### Prompt length limit
 

@@ -53,10 +53,24 @@ def pythia_model():
 
 
 @pytest.fixture(scope="session")
+def qwen_model():
+    from transformer_lens import HookedTransformer
+
+    return HookedTransformer.from_pretrained("Qwen/Qwen2.5-0.5B", device="cpu")
+
+
+@pytest.fixture(scope="session")
 def gpt2_tracer(gpt2_model):
     from accpp_tracer import Tracer
 
     return Tracer(gpt2_model, device="cpu")
+
+
+@pytest.fixture(scope="session")
+def qwen_tracer(qwen_model):
+    from accpp_tracer import Tracer
+
+    return Tracer(qwen_model, device="cpu")
 
 
 @pytest.fixture(scope="session")
@@ -83,6 +97,14 @@ def pythia_ioi(pythia_model):
     return tokens, logits, cache
 
 
+@pytest.fixture(scope="session")
+def qwen_ioi(qwen_model):
+    tokens = qwen_model.to_tokens(IOI_PROMPT)
+    with torch.no_grad():
+        logits, cache = qwen_model.run_with_cache(tokens)
+    return tokens, logits, cache
+
+
 # ---------------------------------------------------------------------------
 # Traced graphs (expensive — traced once per session, asserted in many tests)
 # ---------------------------------------------------------------------------
@@ -102,6 +124,13 @@ def gpt2_linear_graph(gpt2_tracer):
 @pytest.fixture(scope="session")
 def pythia_topk_graph(pythia_tracer):
     return pythia_tracer.trace(IOI_PROMPT, top_k=1)
+
+
+@pytest.fixture(scope="session")
+def qwen_prob_graph(qwen_tracer):
+    """RoPE + GQA + large QK biases: the only fixture where the AH bias /
+    AH offset components are strongly active."""
+    return qwen_tracer.trace(IOI_PROMPT, answer_token=" Mary")
 
 
 def build_idx_to_token(model, tokens):

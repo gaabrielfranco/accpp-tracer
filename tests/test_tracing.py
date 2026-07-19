@@ -99,6 +99,25 @@ def test_trace_firing_pythia(pythia_model, pythia_tracer, pythia_ioi, update_gol
     )
 
 
+def test_trace_firing_qwen(qwen_model, qwen_tracer, qwen_ioi, update_golden):
+    """RoPE + 7x GQA + large QK biases: c_d / c_s offsets strongly nonzero."""
+    tokens, _, cache = qwen_ioi
+    end = tokens.shape[1] - 1
+    (layer, head, src), w = pick_strong_firing(
+        cache, qwen_model.cfg.n_layers, qwen_model.cfg.n_heads, end
+    )
+    assert w > ATTN_THRESH, "no strong firing found — bad test prompt?"
+
+    result = run_firing(qwen_model, qwen_tracer, cache, layer, head, end, src)
+    _check_result(qwen_model, result, layer, end)
+
+    assert_trace_firing_matches(
+        trace_firing_to_jsonable(*result),
+        GOLDEN_DIR / "trace_firing_qwen.json",
+        update_golden,
+    )
+
+
 def test_residual_shares_sum_to_normalized_stream(gpt2_model, gpt2_ioi):
     """The component decomposition must sum to ln_final.hook_normalized.
 

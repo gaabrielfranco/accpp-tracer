@@ -16,10 +16,10 @@ from conftest import GOLDEN_DIR
 from golden_utils import assert_decomposition_matches, decomposition_sketch
 
 
-@pytest.mark.parametrize("model_name", ["gpt2", "pythia"])
-def test_omega_svd_reconstruction(model_name, gpt2_model, pythia_model):
+@pytest.mark.parametrize("model_name", ["gpt2", "pythia", "qwen"])
+def test_omega_svd_reconstruction(model_name, request):
     """U @ diag(S) @ VT must reconstruct Omega = W_Q @ W_K^T for every head."""
-    model = gpt2_model if model_name == "gpt2" else pythia_model
+    model = request.getfixturevalue(f"{model_name}_model")
     config = get_model_config(model)
     U, S, VT = get_omega_decomposition(model, config, "cpu")
 
@@ -43,10 +43,10 @@ def test_omega_svd_reconstruction(model_name, gpt2_model, pythia_model):
     assert max_err < 1e-3, f"Omega reconstruction max err {max_err}"
 
 
-@pytest.mark.parametrize("model_name", ["gpt2", "pythia"])
-def test_pseudoinverses(model_name, gpt2_model, pythia_model):
+@pytest.mark.parametrize("model_name", ["gpt2", "pythia", "qwen"])
+def test_pseudoinverses(model_name, request):
     """W_pinv @ W must be the d_head identity (W has full column rank)."""
-    model = gpt2_model if model_name == "gpt2" else pythia_model
+    model = request.getfixturevalue(f"{model_name}_model")
     config = get_model_config(model)
     W_Q_pinv, W_K_pinv = compute_weight_pseudoinverses(model, config, "cpu")
 
@@ -138,12 +138,14 @@ def test_cache_miss_on_corrupt_file(tmp_path, gpt2_model):
         assert load_decomposition_cache(tmp_path, gpt2_model, False, "cpu") is None
 
 
-@pytest.mark.parametrize("model_name", ["gpt2", "pythia"])
-def test_golden_decomposition(
-    model_name, gpt2_tracer, pythia_tracer, update_golden
-):
-    """Decomposition tensors must match the pre-refactor golden fingerprint."""
-    tracer = gpt2_tracer if model_name == "gpt2" else pythia_tracer
+@pytest.mark.parametrize("model_name", ["gpt2", "pythia", "qwen"])
+def test_golden_decomposition(model_name, request, update_golden):
+    """Decomposition tensors must match the golden fingerprint.
+
+    gpt2/pythia goldens are from pre-refactor code; the qwen golden was
+    baselined at Qwen-family adoption (post-refactor, verified SVD path).
+    """
+    tracer = request.getfixturevalue(f"{model_name}_tracer")
     sketch = decomposition_sketch(
         tracer.U, tracer.S, tracer.VT, tracer.W_Q_pinv, tracer.W_K_pinv
     )
